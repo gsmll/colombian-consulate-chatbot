@@ -29,11 +29,11 @@ logger = logging.getLogger(__name__)
 class Config:
     """Configuration container with validation"""
     OPENAI_API_KEY: str
-    OPENAI_ORG_ID: str
-    OPENAI_PROJECT_ID: str
-    OPENAI_ASSISTANT_ID: str
     TWILIO_ACCOUNT_SID: str
     TWILIO_AUTH_TOKEN: str
+    OPENAI_ORG_ID: Optional[str] = None
+    OPENAI_PROJECT_ID: Optional[str] = None
+    OPENAI_ASSISTANT_ID: Optional[str] = None
     GOOGLE_CALENDAR_ID: Optional[str] = None
     GOOGLE_SERVICE_ACCOUNT_FILE: Optional[str] = None
     TIMEZONE: str = "America/Chicago"
@@ -44,9 +44,6 @@ class Config:
         """Create config from environment variables"""
         required_vars = [
             'OPENAI_API_KEY',
-            'OPENAI_ORG_ID',
-            'OPENAI_PROJECT_ID',
-            'OPENAI_ASSISTANT_ID',
             'TWILIO_ACCOUNT_SID',
             'TWILIO_AUTH_TOKEN'
         ]
@@ -57,11 +54,11 @@ class Config:
             
         return cls(
             OPENAI_API_KEY=os.environ.get('OPENAI_API_KEY'),
+            TWILIO_ACCOUNT_SID=os.environ.get('TWILIO_ACCOUNT_SID'),
+            TWILIO_AUTH_TOKEN=os.environ.get('TWILIO_AUTH_TOKEN'),
             OPENAI_ORG_ID=os.environ.get('OPENAI_ORG_ID'),
             OPENAI_PROJECT_ID=os.environ.get('OPENAI_PROJECT_ID'),
             OPENAI_ASSISTANT_ID=os.environ.get('OPENAI_ASSISTANT_ID'),
-            TWILIO_ACCOUNT_SID=os.environ.get('TWILIO_ACCOUNT_SID'),
-            TWILIO_AUTH_TOKEN=os.environ.get('TWILIO_AUTH_TOKEN'),
             GOOGLE_CALENDAR_ID=os.environ.get('GOOGLE_CALENDAR_ID'),
             GOOGLE_SERVICE_ACCOUNT_FILE=(
                 os.environ.get('GOOGLE_SERVICE_ACCOUNT_FILE')
@@ -125,7 +122,7 @@ class IntentDetector:
             try:
                 comp = self.client.chat.completions.create(
                     model="gpt-5-nano",
-                    # reasoning-style models need output token cap
+                    # Small, fast model for intent classification
                     max_completion_tokens=20,
                     messages=[
                         {"role": "system", "content": (
@@ -437,11 +434,19 @@ class ConsulateBot:
             self.pdf_path = Path(__file__).parent / 'consulate_information.pdf'
             self.pdf_corpus = self._load_pdf_text(self.pdf_path) if self.pdf_path.exists() else ""
             if self.pdf_corpus:
-                logger.info("Loaded consulate_information.pdf for grounding")
+                logger.info(f"Loaded consulate_information.pdf for grounding: {len(self.pdf_corpus)} chars")
                 # Pre-build paragraph chunks for better retrieval
                 self._pdf_paragraphs = self._build_pdf_paragraphs(self.pdf_corpus)
+                logger.info(f"Built {len(self._pdf_paragraphs)} PDF paragraphs for retrieval")
+                # Debug: Show first few paragraphs
+                for i, para in enumerate(self._pdf_paragraphs[:3]):
+                    logger.info(f"PDF para {i}: {para[:200]}...")
+            else:
+                logger.warning("PDF file not found or empty")
+                self._pdf_paragraphs = []
         except Exception as e:
             logger.warning(f"Failed to load PDF for grounding: {e}")
+            self._pdf_paragraphs = []
 
     def _load_pdf_text(self, path: Path) -> str:
         reader = PdfReader(str(path))
@@ -497,16 +502,26 @@ class ConsulateBot:
         Boost currency/fee lines when the user asks about costs or fees.
         Also include neighboring context around top hits to capture headings.
         """
+        logger.info(f"Retrieving context for query: '{query}'")
+        
         if not getattr(self, "_pdf_paragraphs", None):
+            logger.warning("No PDF paragraphs available for retrieval")
             return ""
+        
+        logger.info(f"Available PDF paragraphs: {len(self._pdf_paragraphs)}")
+        
         q = (query or "").lower()
         words = re.findall(r"\w+", q)
+        logger.info(f"Query words: {words}")
+        
         want_fee = any(w in q for w in [
             "fee", "fees", "cost", "price", "tarifa", "tarifas", "costo", "costos", "valor", "pago", "arancel"
         ])
         passport_terms = ["passport", "pasaporte"]
         renew_terms = ["renew", "renewal", "renovar", "renovación"]
         currency_re = re.compile(r"(US\$|\$|USD|COP)\s?\d[\d,\.]*")
+        
+        logger.info(f"Want fee: {want_fee}")
 
         scored: List[tuple[int, int]] = []  # (score, idx)
         for idx, p in enumerate(self._pdf_paragraphs):
@@ -527,12 +542,28 @@ class ConsulateBot:
             # Slight boost for explicit word 'fee schedule' like phrases
             if "fee schedule" in text or "tarif" in text:
                 score += 2
-            if score:
+            if score > 0:
                 scored.append((score, idx))
+                logger.info(f"Para {idx} scored {score}: {p[:100]}...")
 
+        logger.info(f"Found {len(scored)} scoring paragraphs")
+        
         if not scored:
+            logger.warning("No paragraphs scored > 0 for this query")
+            # Debug: show a few random paragraphs to see what we have
+            for i in range(min(3, len(self._pdf_paragraphs))):
+                logger.info(f"Sample para {i}: {self._pdf_paragraphs[i][:200]}...")
+            
+            # Fallback: return first few paragraphs if nothing scored
+            if self._pdf_paragraphs:
+                logger.info("Using fallback: returning first few paragraphs")
+                fallback_ctx = "\n".join(self._pdf_paragraphs[:5])
+                return fallback_ctx[:3500]
             return ""
+            
         scored.sort(key=lambda x: x[0], reverse=True)
+        logger.info(f"Top scoring: {[(s, idx) for s, idx in scored[:3]]}")
+        
         # Collect top-k with neighbors
         chosen_idxs = []
         for _, idx in scored[:k]:
@@ -549,6 +580,8 @@ class ConsulateBot:
             chunks.append(self._pdf_paragraphs[i])
         # Cap total context size
         ctx = "\n".join(chunks)
+        logger.info(f"Retrieved context length: {len(ctx)} chars")
+        logger.info(f"Context preview: {ctx[:300]}...")
         return ctx[:3500]
 
     def _normalize_phone(self, raw: str) -> str:
