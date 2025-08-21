@@ -126,7 +126,7 @@ class IntentDetector:
                 comp = self.client.chat.completions.create(
                     model="gpt-5-nano",
                     # reasoning-style models need output token cap
-                    max_output_tokens=20,
+                    max_completion_tokens=20,
                     reasoning={"effort": "low"},
                     messages=[
                         {"role": "system", "content": (
@@ -566,7 +566,7 @@ class ConsulateBot:
             try:
                 comp = self.openai_client.chat.completions.create(
                     model="gpt-5-nano",
-                    max_output_tokens=500,
+                    max_completion_tokens=1000,
                     reasoning={"effort": "low"},
                     messages=messages,
                 )
@@ -588,7 +588,7 @@ class ConsulateBot:
                     ]
                     comp = self.openai_client.chat.completions.create(
                         model="gpt-5-nano",
-                        max_output_tokens=300,
+                        max_completion_tokens=300,
                         reasoning={"effort": "low"},
                         messages=trimmed_messages,
                     )
