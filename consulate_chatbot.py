@@ -127,7 +127,6 @@ class IntentDetector:
                     model="gpt-5-nano",
                     # reasoning-style models need output token cap
                     max_completion_tokens=20,
-                    reasoning={"effort": "low"},
                     messages=[
                         {"role": "system", "content": (
                             "Classify this user message intent for a consulate bot. Output strict JSON with keys 'intent' and 'confidence' (0-1). "
@@ -567,7 +566,6 @@ class ConsulateBot:
                 comp = self.openai_client.chat.completions.create(
                     model="gpt-5-nano",
                     max_completion_tokens=1000,
-                    reasoning={"effort": "low"},
                     messages=messages,
                 )
             except Exception as e:
@@ -589,7 +587,6 @@ class ConsulateBot:
                     comp = self.openai_client.chat.completions.create(
                         model="gpt-5-nano",
                         max_completion_tokens=300,
-                        reasoning={"effort": "low"},
                         messages=trimmed_messages,
                     )
                 else:
