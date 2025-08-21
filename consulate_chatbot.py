@@ -512,7 +512,13 @@ class ConsulateBot:
         
         q = (query or "").lower()
         words = re.findall(r"\w+", q)
-        logger.info(f"Query words: {words}")
+        # Expand with simple bilingual synonyms/stems for better matching
+        expanded = set(words)
+        if any(w in q for w in ["passport", "pasaporte"]):
+            expanded.update(["passport", "pasaporte", "pasap"])
+        if any(w in q for w in ["renew", "renewal", "renovar", "renovación", "renovacion"]):
+            expanded.update(["renew", "renewal", "renov", "renovar", "renovación", "renovacion", "tramitar", "tramite", "trámite", "issue", "issuance", "expedir", "expedicion", "expedición"])
+        logger.info(f"Query words expanded: {sorted(list(expanded))[:20]}...")
         
         want_fee = any(w in q for w in [
             "fee", "fees", "cost", "price", "tarifa", "tarifas", "costo", "costos", "valor", "pago", "arancel"
@@ -527,7 +533,14 @@ class ConsulateBot:
         for idx, p in enumerate(self._pdf_paragraphs):
             text = p.lower()
             # Base overlap
-            base = sum(1 for w in set(words) if w and w in text)
+            base = 0
+            for w in expanded:
+                if not w:
+                    continue
+                if w in text:
+                    base += 1
+                elif len(w) >= 5 and any(stem in text for stem in [w[:5]]):
+                    base += 1
             if base == 0:
                 # Still consider if paragraph contains strong signals
                 base = 1 if (want_fee and currency_re.search(p)) else 0
@@ -583,6 +596,34 @@ class ConsulateBot:
         logger.info(f"Retrieved context length: {len(ctx)} chars")
         logger.info(f"Context preview: {ctx[:300]}...")
         return ctx[:3500]
+
+    def _is_passport_renewal_query(self, query: str) -> bool:
+        q = (query or "").lower()
+        return ("passport" in q or "pasaporte" in q) and any(w in q for w in ["renew", "renewal", "renovar", "renovación", "renovacion"])
+
+    def _extract_passport_renewal_steps(self, context: str, query: str) -> str:
+        """Extract enumerated steps for passport application/renewal from context.
+        Looks for lines with 1., 2., 3. or semicolon-separated lists in PASAPORTE sections.
+        """
+        if not context:
+            return ""
+        is_spanish = any(w in (query or "").lower() for w in ["cómo", "como", "renovar", "pasaporte"])
+        # Prefer blocks that mention PASAPORTE or PASSPORT
+        blocks = [blk for blk in context.split('\n') if blk]
+        prefer = [b for b in blocks if re.search(r"pasaport|passport", b, re.I)] or blocks
+        text = "\n".join(prefer[:6])
+        # Try to extract enumerated items like 1., 2., 3.
+        items = re.findall(r"(?:^|\s)(\d{1,2})\.?\s*([^;\n]+)(?:;|\n|$)", text, flags=re.M)
+        if not items:
+            # Split by semicolons as fallback
+            parts = [p.strip() for p in re.split(r";|\n", text) if p.strip()]
+            items = [(str(i+1), part) for i, part in enumerate(parts[:5])]
+        if not items:
+            return ""
+        steps = [desc.strip().rstrip('.') for _, desc in items[:5]]
+        if is_spanish:
+            return "Requisitos para renovar el pasaporte (según el documento): " + "; ".join(steps) + "."
+        return "Passport renewal requirements (from the document): " + "; ".join(steps) + "."
 
     def _normalize_phone(self, raw: str) -> str:
         """Extract digits so WhatsApp/SMS prefixes don't fragment identity."""
@@ -718,6 +759,18 @@ class ConsulateBot:
                         return fee_ans
             except Exception:
                 pass
+            # Short-circuit: passport renewal steps
+            try:
+                if self._is_passport_renewal_query(incoming_msg):
+                    steps_ans = self._extract_passport_renewal_steps(grounding, incoming_msg)
+                    if steps_ans:
+                        history.append({"role": "user", "content": incoming_msg})
+                        history.append({"role": "assistant", "content": steps_ans})
+                        if len(history) > 2 * self.max_history:
+                            del history[: len(history) - 2 * self.max_history]
+                        return steps_ans
+            except Exception:
+                pass
 
             system_persona = (
                 "Eres un asistente virtual del consulado. Responde solo a preguntas de servicios consulares "
@@ -726,7 +779,7 @@ class ConsulateBot:
                 "You can speak in both English and Spanish."
             )
             system_context = (
-                f"Use ONLY this context to answer. If the context includes fees/prices, state the exact amount and currency as written. If insufficient, say you don't know.\n{grounding}"
+                f"Use ONLY this context to answer. If details are present, summarize them clearly (steps, requirements, documents, fees) and cite exact amounts as written. If insufficient, say you don't know.\n{grounding}"
                 if grounding else "If no context is provided, say you don't know."
             )
 
@@ -779,6 +832,18 @@ class ConsulateBot:
 
             # Safe fallback when the model returned no text
             if grounding:
+                # Try deterministic extraction for passport steps again as a last resort
+                try:
+                    if self._is_passport_renewal_query(incoming_msg):
+                        steps_ans = self._extract_passport_renewal_steps(grounding, incoming_msg)
+                        if steps_ans:
+                            history.append({"role": "user", "content": incoming_msg})
+                            history.append({"role": "assistant", "content": steps_ans})
+                            if len(history) > 2 * self.max_history:
+                                del history[: len(history) - 2 * self.max_history]
+                            return steps_ans
+                except Exception:
+                    pass
                 return (
                     "No cuento con información suficiente en el documento para responder con precisión. "
                     "¿Puedes reformular tu pregunta o dar más detalles?"
