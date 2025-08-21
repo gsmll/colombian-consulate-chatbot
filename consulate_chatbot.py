@@ -409,7 +409,7 @@ class ConsulateBot:
             api_key=config.OPENAI_API_KEY
         )
         self.threads = {}  # In-memory message history per user id
-        self.max_history = 4  # messages to keep per user
+        self.max_history = 2  # messages to keep per user
         self.twilio_client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
         self.intent = IntentDetector(self.openai_client)
         # Quick auth check; only disable client on real auth errors
@@ -517,7 +517,7 @@ class ConsulateBot:
             total_chars = len(self.pdf_corpus or "")
         except Exception:
             total_chars = 0
-        if len(self._pdf_paragraphs) <= 10 and total_chars <= 15000:
+        if total_chars <= 15000:
             logger.info("PDF is small; using full corpus as context")
             return (self.pdf_corpus or "")[:6000]
         
@@ -675,6 +675,25 @@ class ConsulateBot:
         except Exception:
             return ""
 
+    def _fallback_from_context(self, query: str, context: str) -> str:
+        """Pick 1–2 relevant sentences from the context as a last-resort answer."""
+        if not context:
+            return ""
+        q = (query or "").lower()
+        # Split into sentences conservatively
+        parts = re.split(r"(?<=[\.!?])\s+|\n+|•|\u2022", context)
+        parts = [p.strip() for p in parts if p and len(p.strip()) > 5]
+        if not parts:
+            return ""
+        # Prefer sentences that include any query tokens
+        words = [w for w in re.findall(r"\w+", q) if len(w) > 3]
+        def score(sent: str) -> int:
+            s = sent.lower()
+            return sum(1 for w in set(words) if w in s)
+        parts.sort(key=score, reverse=True)
+        snippet = ". ".join(parts[:2])
+        return snippet[:500]
+
     def _is_fee_query(self, query: str) -> bool:
         q = (query or "").lower()
         fee_words = ["fee", "fees", "cost", "price", "tarifa", "tarifas", "costo", "valor", "pago", "arancel"]
@@ -812,7 +831,7 @@ class ConsulateBot:
             try:
                 comp = self.openai_client.chat.completions.create(
                     model="gpt-5-nano",
-                    max_completion_tokens=350,
+                    #max_completion_tokens=350,
                     messages=messages,
                 )
             except Exception as e:
@@ -833,7 +852,7 @@ class ConsulateBot:
                     ]
                     comp = self.openai_client.chat.completions.create(
                         model="gpt-5-nano",
-                        max_completion_tokens=300,
+                       #max_completion_tokens=300,
                         messages=trimmed_messages,
                     )
                 else:
@@ -850,6 +869,15 @@ class ConsulateBot:
 
             # Safe fallback when the model returned no text
             if grounding:
+                # Last-resort: surface a snippet directly from the document
+                snippet = self._fallback_from_context(incoming_msg, grounding)
+                if snippet:
+                    history.append({"role": "user", "content": incoming_msg})
+                    history.append({"role": "assistant", "content": snippet})
+                    if len(history) > 2 * self.max_history:
+                        del history[: len(history) - 2 * self.max_history]
+                    logger.info("Using context snippet fallback")
+                    return snippet
                 # Try deterministic extraction for passport steps again as a last resort
                 if self.config.USE_DETERMINISTIC_EXTRACTORS:
                     try:
