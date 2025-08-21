@@ -125,8 +125,9 @@ class IntentDetector:
             try:
                 comp = self.client.chat.completions.create(
                     model="gpt-5-nano",
-                    # use model default temperature
-                    max_completion_tokens=20,
+                    # reasoning-style models need output token cap
+                    max_output_tokens=20,
+                    reasoning={"effort": "low"},
                     messages=[
                         {"role": "system", "content": (
                             "Classify this user message intent for a consulate bot. Output strict JSON with keys 'intent' and 'confidence' (0-1). "
@@ -409,9 +410,8 @@ class ConsulateBot:
         self.openai_client = OpenAI(
             api_key=config.OPENAI_API_KEY
         )
-        # In-memory message history per user id
-        self.threads = {}
-        self.max_history = 10  # messages to keep per user
+        self.threads = {}  # In-memory message history per user id
+        self.max_history = 4  # messages to keep per user
         self.twilio_client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
         self.intent = IntentDetector(self.openai_client)
         # Quick auth check; only disable client on real auth errors
@@ -547,7 +547,8 @@ class ConsulateBot:
             system_persona = (
                 "Eres un asistente virtual del consulado. Responde solo a preguntas de servicios consulares "
                 "(visados, pasaportes, asistencia legal, etc.). Si no sabes la respuesta o no está en el contexto, "
-                "indícalo amablemente. You can speak in both English and Spanish."
+                "indícalo amablemente. Responde directo en 1–2 oraciones, sin pasos de razonamiento ni explicaciones largas. "
+                "You can speak in both English and Spanish."
             )
             system_context = (
                 f"Use ONLY this context to answer. If insufficient, say you don't know.\n{grounding}"
@@ -565,8 +566,8 @@ class ConsulateBot:
             try:
                 comp = self.openai_client.chat.completions.create(
                     model="gpt-5-nano",
-                    # use model default temperature
-                    max_completion_tokens=300,
+                    max_output_tokens=500,
+                    reasoning={"effort": "low"},
                     messages=messages,
                 )
             except Exception as e:
@@ -587,7 +588,8 @@ class ConsulateBot:
                     ]
                     comp = self.openai_client.chat.completions.create(
                         model="gpt-5-nano",
-                        max_completion_tokens=150,
+                        max_output_tokens=300,
+                        reasoning={"effort": "low"},
                         messages=trimmed_messages,
                     )
                 else:
