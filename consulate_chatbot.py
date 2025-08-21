@@ -414,22 +414,20 @@ class ConsulateBot:
         self.max_history = 10  # messages to keep per user
         self.twilio_client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
         self.intent = IntentDetector(self.openai_client)
-        # Quick health check for OpenAI auth; if it fails, disable LLM usage gracefully
+        # Quick auth check; only disable client on real auth errors
         try:
-            _ = self.openai_client.chat.completions.create(
-                model="gpt-5-nano",
-                messages=[
-                    {"role": "system", "content": "healthcheck"},
-                    {"role": "user", "content": "ping"}
-                ],
-                max_completion_tokens=1,
-            )
-            logger.info("OpenAI client ready")
+            _ = self.openai_client.models.list()
+            logger.info("OpenAI auth OK")
         except Exception as e:
-            logger.error(f"OpenAI client check failed: {e}. Verify OPENAI_API_KEY and network access.")
-            self.openai_client = None
-            # Also disable model fallback in intent
-            self.intent = IntentDetector(None)
+            msg = str(e)
+            logger.error(f"OpenAI auth check failed: {msg}")
+            auth_error = ("Missing bearer" in msg) or ("401" in msg) or ("invalid_api_key" in msg)
+            if auth_error:
+                self.openai_client = None
+                # Also disable model fallback in intent
+                self.intent = IntentDetector(None)
+            else:
+                logger.warning("Proceeding with OpenAI client despite healthcheck error (non-auth).")
         try:
             self.appointments = AppointmentManager(config)
         except Exception as e:
@@ -471,7 +469,7 @@ class ConsulateBot:
                 scored.append((score, p))
         scored.sort(key=lambda x: x[0], reverse=True)
         context = "\n".join(p for _, p in scored[:k])
-        return context[:4000]
+        return context[:2000]
 
     def _normalize_phone(self, raw: str) -> str:
         """Extract digits so WhatsApp/SMS prefixes don't fragment identity."""
@@ -537,12 +535,36 @@ class ConsulateBot:
             messages.extend(history[-self.max_history:])
             messages.append({"role": "user", "content": incoming_msg})
 
-            comp = self.openai_client.chat.completions.create(
-                model="gpt-5-nano",
-                # use model default temperature
-                max_completion_tokens=300,
-                messages=messages,
-            )
+            try:
+                comp = self.openai_client.chat.completions.create(
+                    model="gpt-5-nano",
+                    # use model default temperature
+                    max_completion_tokens=300,
+                    messages=messages,
+                )
+            except Exception as e:
+                msg = str(e)
+                # Retry with trimmed context if token/output limit triggered
+                if "max_tokens" in msg or "output limit" in msg:
+                    logger.warning("Retrying with trimmed context due to token/output limit")
+                    trimmed_ctx = (grounding or "")[:1200]
+                    trimmed_messages: List[Dict[str, str]] = [
+                        {"role": "system", "content": system_persona},
+                        {"role": "system", "content": (
+                            f"Use ONLY this context to answer. If insufficient, say you don't know.\n{trimmed_ctx}"
+                            if trimmed_ctx else "If no context is provided, say you don't know."
+                        )},
+                        # keep only the last 2 exchanges max
+                        *history[-2:],
+                        {"role": "user", "content": incoming_msg},
+                    ]
+                    comp = self.openai_client.chat.completions.create(
+                        model="gpt-5-nano",
+                        max_completion_tokens=150,
+                        messages=trimmed_messages,
+                    )
+                else:
+                    raise
             reply = comp.choices[0].message.content.strip() if comp.choices else ""
             if reply:
                 # Update history
