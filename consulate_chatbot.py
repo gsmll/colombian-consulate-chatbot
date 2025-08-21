@@ -108,13 +108,25 @@ class IntentDetector:
         r"\bstatus\b",
     ]
     AVAIL_PATTERNS = [
-        r"\bavailable\b",
-        r"\bavailability\b",
+    r"\bavailable\b",
+    r"\bavailability\b",
+    # common misspelling
+    r"\bavail(?:able|ability|ible)\b",
+    # related words users use for openings
+    r"\bopen(?:ing|ings)?\b",
+    r"\bslots?\b",
+    r"\bwhat (times?|hours?)\b",
+    r"\bnext week\b",
+    r"\bthis week\b",
         r"\bwhen (are|is) (appointments|appt|citas) available\b",
         r"\bhorarios disponibles\b",
+    r"\bhoras? disponibles\b",
         r"\bdisponible(s)?\b",
         r"\besta(n)? disponible(s)?\b",
         r"\bhay (citas|horarios)\b",
+    r"\bpr(?:ó|o)xima semana\b",
+    r"\bsemana que viene\b",
+    r"\besta semana\b",
         r"\bes monday available\b",
         r"\besta el lunes disponible\b",
     ]
@@ -141,12 +153,10 @@ class IntentDetector:
             try:
                 comp = self.client.chat.completions.create(
                     model="gpt-5-nano",
-                    # Small, fast model for intent classification
-                    max_completion_tokens=20,
                     messages=[
                         {"role": "system", "content": (
                             "Classify this user message intent for a consulate bot. Output strict JSON with keys 'intent' and 'confidence' (0-1). "
-                            "Intents: appointment_request, appointment_cancel, appointment_check, general_inquiry. "
+                            "Intents: appointment_request, appointment_cancel, appointment_check, appointment_availability, general_inquiry. "
                             "User may write in English or Spanish."
                         )},
                         {"role": "user", "content": text[:400]}
@@ -156,7 +166,7 @@ class IntentDetector:
                 data = json.loads(raw)
                 intent = data.get("intent", "general_inquiry")
                 conf = float(data.get("confidence", 0.6))
-                if intent not in {"appointment_request", "appointment_cancel", "appointment_check", "general_inquiry"}:
+                if intent not in {"appointment_request", "appointment_cancel", "appointment_check", "appointment_availability", "general_inquiry"}:
                     intent = "general_inquiry"
                 return {"intent": intent, "confidence": conf}
             except Exception:
@@ -892,7 +902,14 @@ class ConsulateBot:
                     # Try to parse a requested date/time
                     requested = self._parse_requested_time(incoming_msg)
                     if requested:
-                        result = self.appointments.book_at(user_key, requested.astimezone(ZoneInfo(self.config.TIMEZONE)))
+                        requested_local = requested.astimezone(ZoneInfo(self.config.TIMEZONE))
+                        result = self.appointments.book_at(user_key, requested_local)
+                        if not result.get("success") and "no está disponible" in (result.get("message", "").lower()):
+                            # Offer five nearby alternatives starting from the requested time
+                            slots = self.appointments.next_n_slots(5, start_from=requested_local)
+                            if slots:
+                                opts = "; ".join(s.strftime('%A %d/%m %H:%M') for s in slots)
+                                result["message"] += f" Opciones cercanas: {opts}."
                     else:
                         result = self.appointments.book(user_key)
                     return result["message"]
@@ -912,11 +929,32 @@ class ConsulateBot:
                         if k in t:
                             day_filter = v
                             break
-                    slots = self.appointments.next_n_slots(5, start_from=self.appointments._now(), day_filter=day_filter)
+                    # Respect "next week" queries by starting from next Monday 08:00
+                    start_from = self.appointments._now()
+                    if any(phrase in t for phrase in [
+                        "next week", "proxima semana", "próxima semana", "semana que viene"
+                    ]):
+                        now = start_from
+                        # Monday=0 .. Sunday=6 -> compute next Monday
+                        days_ahead = (7 - now.weekday()) % 7
+                        if days_ahead == 0:
+                            days_ahead = 7
+                        start_from = (now + timedelta(days=days_ahead)).replace(hour=8, minute=0, second=0, microsecond=0)
+                    slots = self.appointments.next_n_slots(5, start_from=start_from, day_filter=day_filter)
+                    is_english = any(w in t for w in [
+                        "available","availability","opening","openings","slot","what","when","next week","this week",
+                        "monday","tuesday","wednesday","thursday","friday"
+                    ])
                     if not slots:
-                        return "No encuentro horarios disponibles en este momento dentro del horario de atención (8:00 a 13:00)."
+                        return (
+                            "I can't find available times within service hours (8:00–13:00)." if is_english
+                            else "No encuentro horarios disponibles en este momento dentro del horario de atención (8:00 a 13:00)."
+                        )
                     fmt = [s.strftime('%A %d/%m %H:%M') for s in slots]
-                    return "Próximos horarios disponibles: " + "; ".join(fmt)
+                    return (
+                        "Next available times: " + "; ".join(fmt) if is_english
+                        else "Próximos horarios disponibles: " + "; ".join(fmt)
+                    )
 
             # 2) Fall back to chat completions for general inquiries
             if not self.openai_client:
