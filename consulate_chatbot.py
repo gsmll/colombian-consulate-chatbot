@@ -480,6 +480,33 @@ class ConsulateBot:
         h = hashlib.sha256((raw or '').encode('utf-8')).hexdigest()
         return h[:24]
 
+    def _extract_text_reply(self, comp: Any) -> str:
+        """Extract plain text from a chat.completions response safely."""
+        try:
+            if not comp or not getattr(comp, "choices", None):
+                return ""
+            choice = comp.choices[0]
+            # Log finish reason and usage if available
+            try:
+                fr = getattr(choice, "finish_reason", None)
+                usage = getattr(comp, "usage", None)
+                logger.info(f"LLM finish_reason={fr} usage={usage}")
+            except Exception:
+                pass
+            msg = getattr(choice, "message", None)
+            if not msg:
+                return ""
+            content = getattr(msg, "content", None)
+            if isinstance(content, str):
+                return content.strip()
+            # Some SDKs may return list of parts
+            if isinstance(content, list):
+                text_parts = [p.get("text", "") if isinstance(p, dict) else str(p) for p in content]
+                return "\n".join(t for t in text_parts if t).strip()
+            return ""
+        except Exception:
+            return ""
+
     def get_or_create_thread(self, user_id: str) -> List[Dict[str, str]]:
         """Get existing chat history list or create new one for the user."""
         if user_id not in self.threads:
@@ -565,7 +592,7 @@ class ConsulateBot:
                     )
                 else:
                     raise
-            reply = comp.choices[0].message.content.strip() if comp.choices else ""
+            reply = self._extract_text_reply(comp)
             if reply:
                 # Update history
                 history.append({"role": "user", "content": incoming_msg})
@@ -575,7 +602,16 @@ class ConsulateBot:
                     del history[: len(history) - 2 * self.max_history]
                 return reply
 
-            return "Lo siento, no pude generar una respuesta."
+            # Safe fallback when the model returned no text
+            if grounding:
+                return (
+                    "No cuento con información suficiente en el documento para responder con precisión. "
+                    "¿Puedes reformular tu pregunta o dar más detalles?"
+                )
+            return (
+                "No pude generar una respuesta en este momento. Intenta reformular la pregunta o "
+                "pídeme programar, verificar o cancelar una cita."
+            )
             
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}")
