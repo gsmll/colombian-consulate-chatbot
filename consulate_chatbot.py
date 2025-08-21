@@ -438,6 +438,8 @@ class ConsulateBot:
             self.pdf_corpus = self._load_pdf_text(self.pdf_path) if self.pdf_path.exists() else ""
             if self.pdf_corpus:
                 logger.info("Loaded consulate_information.pdf for grounding")
+                # Pre-build paragraph chunks for better retrieval
+                self._pdf_paragraphs = self._build_pdf_paragraphs(self.pdf_corpus)
         except Exception as e:
             logger.warning(f"Failed to load PDF for grounding: {e}")
 
@@ -452,23 +454,102 @@ class ConsulateBot:
         # Light cleanup
         return "\n".join(t.strip() for t in texts if t.strip())[:120_000]
 
-    def _retrieve_context(self, query: str, k: int = 6) -> str:
-        """Naive keyword retrieval from PDF text to ground answers."""
-        if not self.pdf_corpus:
-            return ""
-        # Split corpus into paragraphs
-        paras = [p.strip() for p in self.pdf_corpus.split('\n') if p.strip()]
-        q = query.lower()
-        scored = []
+    def _build_pdf_paragraphs(self, corpus: str) -> List[str]:
+        """Build paragraph-like chunks from raw PDF text.
+        Prefer splitting on blank lines; otherwise, create sliding windows of 2-3 lines.
+        """
+        lines = [ln.rstrip() for ln in corpus.splitlines()]
+        # Group by blank lines
+        paras: List[str] = []
+        cur: List[str] = []
+        for ln in lines:
+            if not ln.strip():
+                if cur:
+                    paras.append(" ".join(cur).strip())
+                    cur = []
+            else:
+                cur.append(ln.strip())
+        if cur:
+            paras.append(" ".join(cur).strip())
+        # If the PDF has no blank-line structure, synthesize windows
+        if not paras or len(paras) < 5:
+            win = 3
+            synthesized = []
+            for i in range(0, len(lines), win):
+                chunk = " ".join(ln.strip() for ln in lines[i:i+win] if ln.strip())
+                if chunk:
+                    synthesized.append(chunk)
+            if synthesized:
+                paras = synthesized
+        # De-dup short repeats and keep reasonable length
+        uniq: List[str] = []
+        seen = set()
         for p in paras:
+            key = p[:120]
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(p[:1200])
+        return uniq
+
+    def _retrieve_context(self, query: str, k: int = 8) -> str:
+        """Score and retrieve the most relevant PDF snippets for grounding.
+        Boost currency/fee lines when the user asks about costs or fees.
+        Also include neighboring context around top hits to capture headings.
+        """
+        if not getattr(self, "_pdf_paragraphs", None):
+            return ""
+        q = (query or "").lower()
+        words = re.findall(r"\w+", q)
+        want_fee = any(w in q for w in [
+            "fee", "fees", "cost", "price", "tarifa", "tarifas", "costo", "costos", "valor", "pago", "arancel"
+        ])
+        passport_terms = ["passport", "pasaporte"]
+        renew_terms = ["renew", "renewal", "renovar", "renovación"]
+        currency_re = re.compile(r"(US\$|\$|USD|COP)\s?\d[\d,\.]*")
+
+        scored: List[tuple[int, int]] = []  # (score, idx)
+        for idx, p in enumerate(self._pdf_paragraphs):
             text = p.lower()
-            # simple keyword overlap score
-            score = sum(1 for w in re.findall(r"\w+", q) if w in text)
+            # Base overlap
+            base = sum(1 for w in set(words) if w and w in text)
+            if base == 0:
+                # Still consider if paragraph contains strong signals
+                base = 1 if (want_fee and currency_re.search(p)) else 0
+            score = base
+            # Boosts
+            if want_fee and currency_re.search(p):
+                score += 8
+            if any(t in text for t in passport_terms):
+                score += 2
+            if any(t in text for t in renew_terms):
+                score += 2
+            # Slight boost for explicit word 'fee schedule' like phrases
+            if "fee schedule" in text or "tarif" in text:
+                score += 2
             if score:
-                scored.append((score, p))
+                scored.append((score, idx))
+
+        if not scored:
+            return ""
         scored.sort(key=lambda x: x[0], reverse=True)
-        context = "\n".join(p for _, p in scored[:k])
-        return context[:2000]
+        # Collect top-k with neighbors
+        chosen_idxs = []
+        for _, idx in scored[:k]:
+            for j in [idx-1, idx, idx+1]:
+                if 0 <= j < len(self._pdf_paragraphs):
+                    chosen_idxs.append(j)
+        # De-dup and keep order
+        seen_idx = set()
+        chunks: List[str] = []
+        for i in sorted(set(chosen_idxs)):
+            if i in seen_idx:
+                continue
+            seen_idx.add(i)
+            chunks.append(self._pdf_paragraphs[i])
+        # Cap total context size
+        ctx = "\n".join(chunks)
+        return ctx[:3500]
 
     def _normalize_phone(self, raw: str) -> str:
         """Extract digits so WhatsApp/SMS prefixes don't fragment identity."""
@@ -506,6 +587,55 @@ class ConsulateBot:
         except Exception:
             return ""
 
+    def _is_fee_query(self, query: str) -> bool:
+        q = (query or "").lower()
+        fee_words = ["fee", "fees", "cost", "price", "tarifa", "tarifas", "costo", "valor", "pago", "arancel"]
+        passport_words = ["passport", "pasaporte"]
+        renew_words = ["renew", "renewal", "renovar", "renovación"]
+        return (any(w in q for w in fee_words) or "$" in q) and any(w in q for w in passport_words + renew_words)
+
+    def _extract_fee_answer(self, query: str, context: str) -> str:
+        """Heuristic extraction of fee lines for passport renewal from grounded context.
+        Returns a short bilingual answer quoting the exact amount(s).
+        """
+        if not context:
+            return ""
+        q = (query or "").lower()
+        is_spanish = any(w in q for w in ["cuánto", "renovar", "pasaporte", "tarifa", "costo"])
+        lines = [ln.strip() for ln in context.splitlines() if ln.strip()]
+        currency_re = re.compile(r"(US\$|\$|USD|COP)\s?\d[\d,\.]*")
+        # score lines that mention passport and renew and contain currency
+        scored: List[tuple[int, str]] = []
+        for i, ln in enumerate(lines):
+            low = ln.lower()
+            has_curr = bool(currency_re.search(ln))
+            if not has_curr:
+                continue
+            score = 0
+            if "passport" in low or "pasaporte" in low:
+                score += 3
+            if any(w in low for w in ["renew", "renewal", "renovar", "renovación"]):
+                score += 3
+            if any(w in low for w in ["fee", "tarifa", "costo", "precio", "valor", "pago", "arancel"]):
+                score += 2
+            # consider neighbor lines to capture headings or values on separate lines
+            neighbor = " ".join(lines[max(0, i-1): min(len(lines), i+2)])
+            if currency_re.search(neighbor) and ("passport" in neighbor.lower() or "pasaporte" in neighbor.lower()):
+                score += 2
+            if score:
+                scored.append((score, neighbor.strip()))
+        if not scored:
+            return ""
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best = scored[0][1]
+        # Extract all currency mentions in the best snippet
+        amounts = currency_re.findall(best)
+        # Use the raw neighbor text; keep it concise
+        snippet = best
+        if is_spanish:
+            return f"Según el documento: {snippet}"
+        return f"According to the document: {snippet}"
+
     def get_or_create_thread(self, user_id: str) -> List[Dict[str, str]]:
         """Get existing chat history list or create new one for the user."""
         if user_id not in self.threads:
@@ -542,6 +672,19 @@ class ConsulateBot:
                 )
             history = self.get_or_create_thread(phone_number)
             grounding = self._retrieve_context(incoming_msg)
+            # Short-circuit: if user asks fee for passport renewal and we can extract it from context, answer deterministically
+            try:
+                if self._is_fee_query(incoming_msg):
+                    fee_ans = self._extract_fee_answer(incoming_msg, grounding)
+                    if fee_ans:
+                        # Update minimal history for continuity
+                        history.append({"role": "user", "content": incoming_msg})
+                        history.append({"role": "assistant", "content": fee_ans})
+                        if len(history) > 2 * self.max_history:
+                            del history[: len(history) - 2 * self.max_history]
+                        return fee_ans
+            except Exception:
+                pass
 
             system_persona = (
                 "Eres un asistente virtual del consulado. Responde solo a preguntas de servicios consulares "
@@ -550,7 +693,7 @@ class ConsulateBot:
                 "You can speak in both English and Spanish."
             )
             system_context = (
-                f"Use ONLY this context to answer. If insufficient, say you don't know.\n{grounding}"
+                f"Use ONLY this context to answer. If the context includes fees/prices, state the exact amount and currency as written. If insufficient, say you don't know.\n{grounding}"
                 if grounding else "If no context is provided, say you don't know."
             )
 
