@@ -398,9 +398,15 @@ class ConsulateBot:
     
     def __init__(self, config: Config):
         self.config = config
+        # Log masked API key presence to help diagnose auth issues
+        try:
+            ak = (config.OPENAI_API_KEY or "").strip()
+            masked = (ak[:4] + "…" + ak[-4:]) if ak else "(missing)"
+            logger.info(f"OpenAI API key: {masked}")
+        except Exception:
+            pass
+        # Initialize OpenAI client
         self.openai_client = OpenAI(
-            organization=config.OPENAI_ORG_ID,
-            project=config.OPENAI_PROJECT_ID,
             api_key=config.OPENAI_API_KEY
         )
         # In-memory message history per user id
@@ -408,6 +414,22 @@ class ConsulateBot:
         self.max_history = 10  # messages to keep per user
         self.twilio_client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
         self.intent = IntentDetector(self.openai_client)
+        # Quick health check for OpenAI auth; if it fails, disable LLM usage gracefully
+        try:
+            _ = self.openai_client.chat.completions.create(
+                model="gpt-5-nano",
+                messages=[
+                    {"role": "system", "content": "healthcheck"},
+                    {"role": "user", "content": "ping"}
+                ],
+                max_completion_tokens=1,
+            )
+            logger.info("OpenAI client ready")
+        except Exception as e:
+            logger.error(f"OpenAI client check failed: {e}. Verify OPENAI_API_KEY and network access.")
+            self.openai_client = None
+            # Also disable model fallback in intent
+            self.intent = IntentDetector(None)
         try:
             self.appointments = AppointmentManager(config)
         except Exception as e:
@@ -489,6 +511,11 @@ class ConsulateBot:
                     return result["message"]
 
             # 2) Fall back to chat completions for general inquiries
+            if not self.openai_client:
+                return (
+                    "Lo siento, el servicio de respuestas no está disponible en este momento. "
+                    "Puedo ayudarte a programar, verificar o cancelar una cita."
+                )
             history = self.get_or_create_thread(phone_number)
             grounding = self._retrieve_context(incoming_msg)
 
