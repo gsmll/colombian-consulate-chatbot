@@ -125,7 +125,7 @@ class IntentDetector:
             try:
                 comp = self.client.chat.completions.create(
                     model="gpt-5-nano",
-                    temperature=0,
+                    # use model default temperature
                     max_completion_tokens=20,
                     messages=[
                         {"role": "system", "content": (
@@ -512,7 +512,7 @@ class ConsulateBot:
 
             comp = self.openai_client.chat.completions.create(
                 model="gpt-5-nano",
-                temperature=0,
+                # use model default temperature
                 max_completion_tokens=300,
                 messages=messages,
             )
