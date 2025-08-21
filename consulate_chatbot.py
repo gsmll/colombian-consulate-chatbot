@@ -15,6 +15,7 @@ from flask import Flask, request, jsonify, Response
 # Google Calendar
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -154,7 +155,11 @@ class AppointmentManager:
         self.scopes = ['https://www.googleapis.com/auth/calendar']
         self.calendar_id = self.cfg.GOOGLE_CALENDAR_ID or 'primary'
         self.duration = timedelta(minutes=self.cfg.APPOINTMENT_DURATION_MINUTES)
-        self.service = self._build_calendar_service()
+    self.service = self._build_calendar_service()
+    self._verify_calendar_access()
+        logger.info(
+            f"Calendar config: id={self.calendar_id}, tz={self.cfg.TIMEZONE}, duration_min={self.cfg.APPOINTMENT_DURATION_MINUTES}"
+        )
 
     def _build_calendar_service(self):
         creds = None
@@ -168,10 +173,31 @@ class AppointmentManager:
                         break
             if not sa_path:
                 raise ValueError("Missing GOOGLE_SERVICE_ACCOUNT_FILE or GOOGLE_APPLICATION_CREDENTIALS env var, and no service account JSON detected in current directory.")
+            logger.info(f"Using Google credentials file at: {os.path.abspath(sa_path)}")
             creds = service_account.Credentials.from_service_account_file(sa_path, scopes=self.scopes)
+            # Log the service account email to aid configuration
+            try:
+                sa_email = getattr(creds, 'service_account_email', None)
+                if sa_email:
+                    logger.info(f"Google service account: {sa_email}")
+            except Exception:
+                pass
             return build('calendar', 'v3', credentials=creds, cache_discovery=False)
         except Exception as e:
             logger.error(f"Google Calendar auth/build error: {e}")
+            raise
+
+    def _verify_calendar_access(self) -> None:
+        """Fail fast if the calendar ID is invalid or not shared with the service account."""
+        try:
+            info = self.service.calendars().get(calendarId=self.calendar_id).execute()
+            logger.info(f"Google Calendar ready: {info.get('summary')} ({self.calendar_id})")
+        except HttpError as he:
+            status = getattr(he.resp, 'status', None)
+            if status in (403, 404):
+                logger.error(
+                    "Calendar not found or no access. Ensure GOOGLE_CALENDAR_ID is correct and the calendar is shared with the service account (Make changes to events)."
+                )
             raise
 
     # Utility time helpers
