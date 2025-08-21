@@ -155,8 +155,8 @@ class AppointmentManager:
         self.scopes = ['https://www.googleapis.com/auth/calendar']
         self.calendar_id = self.cfg.GOOGLE_CALENDAR_ID or 'primary'
         self.duration = timedelta(minutes=self.cfg.APPOINTMENT_DURATION_MINUTES)
-    self.service = self._build_calendar_service()
-    self._verify_calendar_access()
+        self.service = self._build_calendar_service()
+        self._verify_calendar_access()
         logger.info(
             f"Calendar config: id={self.calendar_id}, tz={self.cfg.TIMEZONE}, duration_min={self.cfg.APPOINTMENT_DURATION_MINUTES}"
         )
