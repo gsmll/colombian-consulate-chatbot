@@ -126,7 +126,7 @@ class IntentDetector:
                 comp = self.client.chat.completions.create(
                     model="gpt-5-nano",
                     temperature=0,
-                    max_tokens=20,
+                    max_completion_tokens=20,
                     messages=[
                         {"role": "system", "content": (
                             "Classify this user message intent for a consulate bot. Output strict JSON with keys 'intent' and 'confidence' (0-1). "
@@ -513,7 +513,7 @@ class ConsulateBot:
             comp = self.openai_client.chat.completions.create(
                 model="gpt-5-nano",
                 temperature=0,
-                max_tokens=300,
+                max_completion_tokens=300,
                 messages=messages,
             )
             reply = comp.choices[0].message.content.strip() if comp.choices else ""
