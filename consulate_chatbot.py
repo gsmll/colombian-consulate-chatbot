@@ -11,6 +11,8 @@ from openai import OpenAI
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
 from flask import Flask, request, jsonify, Response
+from pathlib import Path
+from PyPDF2 import PdfReader
 
 # Google Calendar
 from google.oauth2 import service_account
@@ -34,7 +36,7 @@ class Config:
     TWILIO_AUTH_TOKEN: str
     GOOGLE_CALENDAR_ID: Optional[str] = None
     GOOGLE_SERVICE_ACCOUNT_FILE: Optional[str] = None
-    TIMEZONE: str = "America/Bogota"
+    TIMEZONE: str = "America/Chicago"
     APPOINTMENT_DURATION_MINUTES: int = 30
 
     @classmethod
@@ -65,7 +67,7 @@ class Config:
                 os.environ.get('GOOGLE_SERVICE_ACCOUNT_FILE')
                 or os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
             ),
-            TIMEZONE=os.environ.get('TIMEZONE', 'America/Bogota'),
+            TIMEZONE=os.environ.get('TIMEZONE', 'America/Chicago'),
             APPOINTMENT_DURATION_MINUTES=int(os.environ.get('APPOINTMENT_DURATION_MINUTES', '30'))
         )
 
@@ -401,8 +403,9 @@ class ConsulateBot:
             project=config.OPENAI_PROJECT_ID,
             api_key=config.OPENAI_API_KEY
         )
-        self.assistant = self.openai_client.beta.assistants.retrieve(config.OPENAI_ASSISTANT_ID)
+        # In-memory message history per user id
         self.threads = {}
+        self.max_history = 10  # messages to keep per user
         self.twilio_client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
         self.intent = IntentDetector(self.openai_client)
         try:
@@ -410,6 +413,43 @@ class ConsulateBot:
         except Exception as e:
             logger.warning(f"Appointment manager disabled due to error: {e}")
             self.appointments = None
+        # Load PDF once for grounding
+        try:
+            self.pdf_path = Path(__file__).parent / 'consulate_information.pdf'
+            self.pdf_corpus = self._load_pdf_text(self.pdf_path) if self.pdf_path.exists() else ""
+            if self.pdf_corpus:
+                logger.info("Loaded consulate_information.pdf for grounding")
+        except Exception as e:
+            logger.warning(f"Failed to load PDF for grounding: {e}")
+
+    def _load_pdf_text(self, path: Path) -> str:
+        reader = PdfReader(str(path))
+        texts = []
+        for page in reader.pages:
+            try:
+                texts.append(page.extract_text() or "")
+            except Exception:
+                continue
+        # Light cleanup
+        return "\n".join(t.strip() for t in texts if t.strip())[:120_000]
+
+    def _retrieve_context(self, query: str, k: int = 6) -> str:
+        """Naive keyword retrieval from PDF text to ground answers."""
+        if not self.pdf_corpus:
+            return ""
+        # Split corpus into paragraphs
+        paras = [p.strip() for p in self.pdf_corpus.split('\n') if p.strip()]
+        q = query.lower()
+        scored = []
+        for p in paras:
+            text = p.lower()
+            # simple keyword overlap score
+            score = sum(1 for w in re.findall(r"\w+", q) if w in text)
+            if score:
+                scored.append((score, p))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        context = "\n".join(p for _, p in scored[:k])
+        return context[:4000]
 
     def _normalize_phone(self, raw: str) -> str:
         """Extract digits so WhatsApp/SMS prefixes don't fragment identity."""
@@ -420,11 +460,11 @@ class ConsulateBot:
         h = hashlib.sha256((raw or '').encode('utf-8')).hexdigest()
         return h[:24]
 
-    def get_or_create_thread(self, phone_number: str):
-        """Get existing thread or create new one for user"""
-        if phone_number not in self.threads:
-            self.threads[phone_number] = self.openai_client.beta.threads.create()
-        return self.threads[phone_number]
+    def get_or_create_thread(self, user_id: str) -> List[Dict[str, str]]:
+        """Get existing chat history list or create new one for the user."""
+        if user_id not in self.threads:
+            self.threads[user_id] = []
+        return self.threads[user_id]
 
     def process_message(self, phone_number: str, incoming_msg: str) -> str:
         """Process incoming message and return response, with appointment intents."""
@@ -448,43 +488,43 @@ class ConsulateBot:
                     result = self.appointments.check_next(user_key)
                     return result["message"]
 
-            # 2) Fall back to assistant for general inquiries
-            thread = self.get_or_create_thread(phone_number)
+            # 2) Fall back to chat completions for general inquiries
+            history = self.get_or_create_thread(phone_number)
+            grounding = self._retrieve_context(incoming_msg)
 
-            self.openai_client.beta.threads.messages.create(
-                thread_id=thread.id,
-                role="user",
-                content=incoming_msg
+            system_persona = (
+                "Eres un asistente virtual del consulado. Responde solo a preguntas de servicios consulares "
+                "(visados, pasaportes, asistencia legal, etc.). Si no sabes la respuesta o no está en el contexto, "
+                "indícalo amablemente. You can speak in both English and Spanish."
+            )
+            system_context = (
+                f"Use ONLY this context to answer. If insufficient, say you don't know.\n{grounding}"
+                if grounding else "If no context is provided, say you don't know."
             )
 
-            run = self.openai_client.beta.threads.runs.create(
-                thread_id=thread.id,
-                assistant_id=self.assistant.id,
-                instructions="""
-                Eres un asistente virtual del consulado que proporciona información y 
-                asistencia sobre servicios consulares. Responde solo a preguntas relacionadas 
-                con servicios consulares como visados, pasaportes, asistencia legal, y otros 
-                servicios que ofrece el consulado. Si no sabes la respuesta a una pregunta o 
-                no está relacionada con los servicios consulares, indícalo amablemente. 
-                You can speak in both English and Spanish.
-                """
-            )
+            messages: List[Dict[str, str]] = [
+                {"role": "system", "content": system_persona},
+                {"role": "system", "content": system_context},
+            ]
+            # Append a small rolling history to preserve continuity
+            messages.extend(history[-self.max_history:])
+            messages.append({"role": "user", "content": incoming_msg})
 
-            while True:
-                run_status = self.openai_client.beta.threads.runs.retrieve(
-                    thread_id=thread.id,
-                    run_id=run.id
-                )
-                if run_status.status == 'completed':
-                    break
-
-            messages = self.openai_client.beta.threads.messages.list(
-                thread_id=thread.id
+            comp = self.openai_client.chat.completions.create(
+                model="gpt-5-nano",
+                temperature=0,
+                max_tokens=300,
+                messages=messages,
             )
-            
-            for message in messages.data:
-                if message.role == "assistant":
-                    return message.content[0].text.value
+            reply = comp.choices[0].message.content.strip() if comp.choices else ""
+            if reply:
+                # Update history
+                history.append({"role": "user", "content": incoming_msg})
+                history.append({"role": "assistant", "content": reply})
+                # trim
+                if len(history) > 2 * self.max_history:
+                    del history[: len(history) - 2 * self.max_history]
+                return reply
 
             return "Lo siento, no pude generar una respuesta."
             
