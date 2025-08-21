@@ -38,6 +38,7 @@ class Config:
     GOOGLE_SERVICE_ACCOUNT_FILE: Optional[str] = None
     TIMEZONE: str = "America/Chicago"
     APPOINTMENT_DURATION_MINUTES: int = 30
+    USE_DETERMINISTIC_EXTRACTORS: bool = False
 
     @classmethod
     def from_env(cls) -> 'Config':
@@ -65,7 +66,8 @@ class Config:
                 or os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
             ),
             TIMEZONE=os.environ.get('TIMEZONE', 'America/Chicago'),
-            APPOINTMENT_DURATION_MINUTES=int(os.environ.get('APPOINTMENT_DURATION_MINUTES', '30'))
+            APPOINTMENT_DURATION_MINUTES=int(os.environ.get('APPOINTMENT_DURATION_MINUTES', '30')),
+            USE_DETERMINISTIC_EXTRACTORS=(os.environ.get('USE_DETERMINISTIC_EXTRACTORS', '0').lower() in {'1','true','yes'})
         )
 
 
@@ -509,6 +511,15 @@ class ConsulateBot:
             return ""
         
         logger.info(f"Available PDF paragraphs: {len(self._pdf_paragraphs)}")
+        # If the PDF is very small (e.g., <= 10 paragraphs, <= 15k chars), just provide the whole corpus.
+        # This avoids missing info and still fits within small-model limits.
+        try:
+            total_chars = len(self.pdf_corpus or "")
+        except Exception:
+            total_chars = 0
+        if len(self._pdf_paragraphs) <= 10 and total_chars <= 15000:
+            logger.info("PDF is small; using full corpus as context")
+            return (self.pdf_corpus or "")[:6000]
         
         q = (query or "").lower()
         words = re.findall(r"\w+", q)
@@ -599,7 +610,10 @@ class ConsulateBot:
 
     def _is_passport_renewal_query(self, query: str) -> bool:
         q = (query or "").lower()
-        return ("passport" in q or "pasaporte" in q) and any(w in q for w in ["renew", "renewal", "renovar", "renovación", "renovacion"])
+        has_passport = ("passport" in q) or ("pasaport" in q)  # matches pasaporte/pasaport-
+        # Catch Spanish conjugations: renuevo, renovar, renovación, etc., and English renew/renewal
+        renew_signals = ["renew", "renewal", "renov", "tramitar", "trámite", "tramite", "expedir", "expedición", "expedicion", "reexpedir", "sacar"]
+        return has_passport and any(sig in q for sig in renew_signals)
 
     def _extract_passport_renewal_steps(self, context: str, query: str) -> str:
         """Extract enumerated steps for passport application/renewal from context.
@@ -747,36 +761,40 @@ class ConsulateBot:
             history = self.get_or_create_thread(phone_number)
             grounding = self._retrieve_context(incoming_msg)
             # Short-circuit: if user asks fee for passport renewal and we can extract it from context, answer deterministically
-            try:
-                if self._is_fee_query(incoming_msg):
-                    fee_ans = self._extract_fee_answer(incoming_msg, grounding)
-                    if fee_ans:
-                        # Update minimal history for continuity
-                        history.append({"role": "user", "content": incoming_msg})
-                        history.append({"role": "assistant", "content": fee_ans})
-                        if len(history) > 2 * self.max_history:
-                            del history[: len(history) - 2 * self.max_history]
-                        return fee_ans
-            except Exception:
-                pass
+            if self.config.USE_DETERMINISTIC_EXTRACTORS:
+                try:
+                    if self._is_fee_query(incoming_msg):
+                        fee_ans = self._extract_fee_answer(incoming_msg, grounding)
+                        if fee_ans:
+                            logger.info("Using deterministic fee extractor answer")
+                            # Update minimal history for continuity
+                            history.append({"role": "user", "content": incoming_msg})
+                            history.append({"role": "assistant", "content": fee_ans})
+                            if len(history) > 2 * self.max_history:
+                                del history[: len(history) - 2 * self.max_history]
+                            return fee_ans
+                except Exception:
+                    pass
             # Short-circuit: passport renewal steps
-            try:
-                if self._is_passport_renewal_query(incoming_msg):
-                    steps_ans = self._extract_passport_renewal_steps(grounding, incoming_msg)
-                    if steps_ans:
-                        history.append({"role": "user", "content": incoming_msg})
-                        history.append({"role": "assistant", "content": steps_ans})
-                        if len(history) > 2 * self.max_history:
-                            del history[: len(history) - 2 * self.max_history]
-                        return steps_ans
-            except Exception:
-                pass
+            if self.config.USE_DETERMINISTIC_EXTRACTORS:
+                try:
+                    if self._is_passport_renewal_query(incoming_msg):
+                        steps_ans = self._extract_passport_renewal_steps(grounding, incoming_msg)
+                        if steps_ans:
+                            logger.info("Using deterministic passport-steps extractor answer")
+                            history.append({"role": "user", "content": incoming_msg})
+                            history.append({"role": "assistant", "content": steps_ans})
+                            if len(history) > 2 * self.max_history:
+                                del history[: len(history) - 2 * self.max_history]
+                            return steps_ans
+                except Exception:
+                    pass
 
             system_persona = (
                 "Eres un asistente virtual del consulado. Responde solo a preguntas de servicios consulares "
                 "(visados, pasaportes, asistencia legal, etc.). Si no sabes la respuesta o no está en el contexto, "
                 "indícalo amablemente. Responde directo en 1–2 oraciones, sin pasos de razonamiento ni explicaciones largas. "
-                "You can speak in both English and Spanish."
+                "Responde en el mismo idioma del usuario (español o inglés)."
             )
             system_context = (
                 f"Use ONLY this context to answer. If details are present, summarize them clearly (steps, requirements, documents, fees) and cite exact amounts as written. If insufficient, say you don't know.\n{grounding}"
@@ -794,7 +812,7 @@ class ConsulateBot:
             try:
                 comp = self.openai_client.chat.completions.create(
                     model="gpt-5-nano",
-                    max_completion_tokens=1000,
+                    max_completion_tokens=350,
                     messages=messages,
                 )
             except Exception as e:
@@ -833,17 +851,18 @@ class ConsulateBot:
             # Safe fallback when the model returned no text
             if grounding:
                 # Try deterministic extraction for passport steps again as a last resort
-                try:
-                    if self._is_passport_renewal_query(incoming_msg):
-                        steps_ans = self._extract_passport_renewal_steps(grounding, incoming_msg)
-                        if steps_ans:
-                            history.append({"role": "user", "content": incoming_msg})
-                            history.append({"role": "assistant", "content": steps_ans})
-                            if len(history) > 2 * self.max_history:
-                                del history[: len(history) - 2 * self.max_history]
-                            return steps_ans
-                except Exception:
-                    pass
+                if self.config.USE_DETERMINISTIC_EXTRACTORS:
+                    try:
+                        if self._is_passport_renewal_query(incoming_msg):
+                            steps_ans = self._extract_passport_renewal_steps(grounding, incoming_msg)
+                            if steps_ans:
+                                history.append({"role": "user", "content": incoming_msg})
+                                history.append({"role": "assistant", "content": steps_ans})
+                                if len(history) > 2 * self.max_history:
+                                    del history[: len(history) - 2 * self.max_history]
+                                return steps_ans
+                    except Exception:
+                        pass
                 return (
                     "No cuento con información suficiente en el documento para responder con precisión. "
                     "¿Puedes reformular tu pregunta o dar más detalles?"
