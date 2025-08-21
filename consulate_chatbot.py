@@ -107,6 +107,17 @@ class IntentDetector:
         r"\bwhen is my appointment\b",
         r"\bstatus\b",
     ]
+    AVAIL_PATTERNS = [
+        r"\bavailable\b",
+        r"\bavailability\b",
+        r"\bwhen (are|is) (appointments|appt|citas) available\b",
+        r"\bhorarios disponibles\b",
+        r"\bdisponible(s)?\b",
+        r"\besta(n)? disponible(s)?\b",
+        r"\bhay (citas|horarios)\b",
+        r"\bes monday available\b",
+        r"\besta el lunes disponible\b",
+    ]
 
     def __init__(self, client: Optional[OpenAI] = None):
         self.client = client
@@ -116,8 +127,11 @@ class IntentDetector:
         t = (text or "").lower()
         def any_match(patterns: List[str]) -> bool:
             return any(re.search(p, t) for p in patterns)
+        # Prefer availability over booking if user asks about open times
+        if any_match(self.AVAIL_PATTERNS):
+            return {"intent": "appointment_availability", "confidence": 0.95}
         if any_match(self.BOOK_PATTERNS):
-            return {"intent": "appointment_request", "confidence": 0.95}
+            return {"intent": "appointment_request", "confidence": 0.9}
         if any_match(self.CANCEL_PATTERNS):
             return {"intent": "appointment_cancel", "confidence": 0.95}
         if any_match(self.CHECK_PATTERNS):
@@ -305,6 +319,28 @@ class AppointmentManager:
                 return cur
             # Move to next slot
             cur = cur + timedelta(minutes=30)
+
+    def next_n_slots(self, n: int = 5, start_from: Optional[datetime] = None, day_filter: Optional[int] = None) -> List[datetime]:
+        """Return next n available start times. Optional day_filter is weekday index 0-6."""
+        slots: List[datetime] = []
+        cur = self._next_business_slot(start_from)
+        guard = 0
+        while len(slots) < n and guard < 2000:
+            guard += 1
+            if day_filter is not None and cur.weekday() != day_filter:
+                # jump to next day at 08:00
+                cur = (cur + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+                cur = self._next_business_slot(cur)
+                continue
+            if self._validate_business_time(cur) and not self._has_conflict(cur, cur + self.duration):
+                slots.append(cur)
+            # advance 30 minutes
+            cur = cur + timedelta(minutes=30)
+            # roll over end of day to next day start
+            if cur.hour >= 13:
+                cur = (cur + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+                cur = self._next_business_slot(cur)
+        return slots
 
     def _validate_business_time(self, when: datetime) -> bool:
         if when.weekday() >= 5:
@@ -711,6 +747,11 @@ class ConsulateBot:
         hour = None
         minute = 0
         ampm = None
+        # 'noon' and 'mediodia'
+        if "noon" in t or "medio" in t:
+            hour = 12
+            minute = 0
+            ampm = "pm"
         hm = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?\b", t)
         if hm:
             hour = int(hm.group(1))
@@ -861,6 +902,21 @@ class ConsulateBot:
                 if intent["intent"] == "appointment_check":
                     result = self.appointments.check_next(user_key)
                     return result["message"]
+                if intent["intent"] == "appointment_availability":
+                    # If the user mentions a weekday, filter; otherwise show next 5 slots
+                    t = incoming_msg.lower()
+                    mapping = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,
+                               "lunes":0,"martes":1,"miercoles":2,"miércoles":2,"jueves":3,"viernes":4}
+                    day_filter = None
+                    for k, v in mapping.items():
+                        if k in t:
+                            day_filter = v
+                            break
+                    slots = self.appointments.next_n_slots(5, start_from=self.appointments._now(), day_filter=day_filter)
+                    if not slots:
+                        return "No encuentro horarios disponibles en este momento dentro del horario de atención (8:00 a 13:00)."
+                    fmt = [s.strftime('%A %d/%m %H:%M') for s in slots]
+                    return "Próximos horarios disponibles: " + "; ".join(fmt)
 
             # 2) Fall back to chat completions for general inquiries
             if not self.openai_client:
