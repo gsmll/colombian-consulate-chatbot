@@ -76,6 +76,9 @@ class IntentDetector:
 
     BOOK_PATTERNS = [
         r"\bappoint(ment|ar)?\b",
+        r"\bappoint\w{3,}\b",  # catch misspellings like appointmnet
+        r"\bappoi?ntm?ent\b",   # common typos
+        r"\bappt\b",
         r"\bbook(ing)?\b",
         r"\bschedul(e|ed|ing|ar|ar una|ar la)\b",
         r"\bmake an? appointment\b",
@@ -281,20 +284,20 @@ class AppointmentManager:
             cur = cur.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         else:
             cur = cur.replace(minute=minute, second=0, microsecond=0)
-        # Business hours 09:00-17:00
+        # Business hours 08:00-13:00 (Atención al público)
         while True:
             # Skip weekends
             if cur.weekday() >= 5:
                 # move to next Monday 09:00
                 days_ahead = 7 - cur.weekday()
                 cur = cur + timedelta(days=days_ahead)
-                cur = cur.replace(hour=9, minute=0, second=0, microsecond=0)
+                cur = cur.replace(hour=8, minute=0, second=0, microsecond=0)
                 continue
-            if cur.hour < 9:
-                cur = cur.replace(hour=9, minute=0, second=0, microsecond=0)
-            if cur.hour >= 17:
-                # move to next day 09:00
-                cur = (cur + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+            if cur.hour < 8:
+                cur = cur.replace(hour=8, minute=0, second=0, microsecond=0)
+            if cur.hour >= 13:
+                # move to next day 08:00
+                cur = (cur + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
                 continue
             # Check conflict
             end = cur + self.duration
@@ -302,6 +305,30 @@ class AppointmentManager:
                 return cur
             # Move to next slot
             cur = cur + timedelta(minutes=30)
+
+    def _validate_business_time(self, when: datetime) -> bool:
+        if when.weekday() >= 5:
+            return False
+        local = when
+        if local.hour < 8 or local.hour >= 13:
+            return False
+        return True
+
+    def book_at(self, user_key: str, when: datetime) -> Dict[str, Any]:
+        # Enforce monthly limit
+        monthly = self._user_events_in_month(user_key)
+        if len(monthly) >= 3:
+            return {"success": False, "message": "Has alcanzado el límite de 3 citas este mes."}
+        if not self._validate_business_time(when):
+            return {"success": False, "message": "El horario de atención es de lunes a viernes de 8:00 a.m. a 1:00 p.m."}
+        # Round to nearest 30-min slot
+        minute = (when.minute // 30) * 30
+        when = when.replace(minute=minute, second=0, microsecond=0)
+        end = when + self.duration
+        if self._has_conflict(when, end):
+            return {"success": False, "message": "Ese horario no está disponible. ¿Deseas el siguiente disponible?"}
+        created = self.service.events().insert(calendarId=self.calendar_id, body=self._event_payload(user_key, when)).execute()
+        return {"success": True, "message": f"Cita confirmada para {when.strftime('%d/%m/%Y %H:%M')}. ID: {created.get('id')}", "event": created}
 
     def _event_payload(self, user_key: str, when: datetime, summary: str = "Consulate Appointment") -> dict:
         end = when + self.duration
@@ -675,6 +702,65 @@ class ConsulateBot:
         except Exception:
             return ""
 
+    def _parse_requested_time(self, text: str) -> Optional[datetime]:
+        """Parse simple requests like 'monday at 1', '8/25 at 1:00 p', 'lunes 1pm'. Returns tz-aware datetime."""
+        t = (text or "").lower()
+        now = datetime.now(ZoneInfo(self.config.TIMEZONE))
+        # Try explicit date like 8/25 or 08/25/2025
+        m = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", t)
+        hour = None
+        minute = 0
+        ampm = None
+        hm = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?\b", t)
+        if hm:
+            hour = int(hm.group(1))
+            minute = int(hm.group(2) or 0)
+            ampm = (hm.group(3) or "").replace(".", "")
+        # Weekday names
+        weekdays_en = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+        weekdays_es = ["lunes","martes","miercoles","miércoles","jueves","viernes","sabado","sábado","domingo"]
+        wd_idx = None
+        for i, name in enumerate(weekdays_en):
+            if name in t:
+                wd_idx = i
+                break
+        if wd_idx is None:
+            for i, name in enumerate(weekdays_es):
+                if name in t:
+                    # map spanish to python weekday index
+                    mapping = {"lunes":0,"martes":1,"miercoles":2,"miércoles":2,"jueves":3,"viernes":4,"sabado":5,"sábado":5,"domingo":6}
+                    wd_idx = mapping[name]
+                    break
+        # Compute base date
+        dt_date = None
+        if m:
+            month = int(m.group(1))
+            day = int(m.group(2))
+            year = int(m.group(3)) if m.group(3) else now.year
+            if year < 100:
+                year += 2000
+            try:
+                dt_date = now.replace(year=year, month=month, day=day)
+            except ValueError:
+                return None
+        elif wd_idx is not None:
+            # next occurrence of that weekday (including today if later)
+            days_ahead = (wd_idx - now.weekday()) % 7
+            if days_ahead == 0 and hour is not None and (now.hour > hour):
+                days_ahead = 7
+            dt_date = (now + timedelta(days=days_ahead)).replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            return None
+        # Time component
+        if hour is None:
+            hour = 9  # default morning hour if not provided
+        if ampm:
+            if ampm.startswith('p') and hour < 12:
+                hour += 12
+            if ampm.startswith('a') and hour == 12:
+                hour = 0
+        return dt_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
     def _fallback_from_context(self, query: str, context: str) -> str:
         """Pick 1–2 relevant sentences from the context as a last-resort answer."""
         if not context:
@@ -762,7 +848,12 @@ class ConsulateBot:
             if self.appointments and intent["confidence"] >= 0.8:
                 user_key = self._normalize_phone(phone_number)
                 if intent["intent"] == "appointment_request":
-                    result = self.appointments.book(user_key)
+                    # Try to parse a requested date/time
+                    requested = self._parse_requested_time(incoming_msg)
+                    if requested:
+                        result = self.appointments.book_at(user_key, requested.astimezone(ZoneInfo(self.config.TIMEZONE)))
+                    else:
+                        result = self.appointments.book(user_key)
                     return result["message"]
                 if intent["intent"] == "appointment_cancel":
                     result = self.appointments.cancel_next(user_key)
