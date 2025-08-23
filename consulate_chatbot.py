@@ -27,6 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class Config:
     """Configuration container with validation"""
@@ -49,11 +50,12 @@ class Config:
             'TWILIO_ACCOUNT_SID',
             'TWILIO_AUTH_TOKEN'
         ]
-        
+
         missing = [var for var in required_vars if not os.environ.get(var)]
         if missing:
-            raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
-            
+            raise ValueError(
+                f"Missing required environment variables: {', '.join(missing)}")
+
         return cls(
             OPENAI_API_KEY=os.environ.get('OPENAI_API_KEY'),
             TWILIO_ACCOUNT_SID=os.environ.get('TWILIO_ACCOUNT_SID'),
@@ -67,7 +69,8 @@ class Config:
                 or os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
             ),
             TIMEZONE=os.environ.get('TIMEZONE', 'America/Chicago'),
-            APPOINTMENT_DURATION_MINUTES=int(os.environ.get('APPOINTMENT_DURATION_MINUTES', '30')),
+            APPOINTMENT_DURATION_MINUTES=int(
+                os.environ.get('APPOINTMENT_DURATION_MINUTES', '30')),
         )
 
 
@@ -82,7 +85,8 @@ class AppointmentManager:
         self.tz = ZoneInfo(self.cfg.TIMEZONE)
         self.scopes = ['https://www.googleapis.com/auth/calendar']
         self.calendar_id = self.cfg.GOOGLE_CALENDAR_ID or 'primary'
-        self.duration = timedelta(minutes=self.cfg.APPOINTMENT_DURATION_MINUTES)
+        self.duration = timedelta(
+            minutes=self.cfg.APPOINTMENT_DURATION_MINUTES)
         self.service = self._build_calendar_service()
         self._verify_calendar_access()
         logger.info(
@@ -94,17 +98,18 @@ class AppointmentManager:
         try:
             sa_path = self.cfg.GOOGLE_SERVICE_ACCOUNT_FILE
             if not sa_path:
-                raise ValueError("Missing GOOGLE_SERVICE_ACCOUNT_FILE or GOOGLE_APPLICATION_CREDENTIALS env var.")
-            logger.info(f"Using Google credentials file at: {os.path.abspath(sa_path)}")
-            creds = service_account.Credentials.from_service_account_file(sa_path, scopes=self.scopes)
-            # Log the service account email to aid configuration
+                raise ValueError(
+                    "Missing GOOGLE_SERVICE_ACCOUNT_FILE or GOOGLE_APPLICATION_CREDENTIALS env var.")
+            logger.info(
+                f"Using Google credentials file at: {os.path.abspath(sa_path)}")
+            creds = service_account.Credentials.from_service_account_file(
+                sa_path, scopes=self.scopes)
             try:
                 sa_email = getattr(creds, 'service_account_email', None)
                 if sa_email:
                     logger.info(f"Google service account: {sa_email}")
             except Exception:
                 pass
-            # Use default HTTP transport; do not pass both http and credentials (mutually exclusive)
             return build('calendar', 'v3', credentials=creds, cache_discovery=False)
         except Exception as e:
             logger.error(f"Google Calendar auth/build error: {e}")
@@ -113,8 +118,10 @@ class AppointmentManager:
     def _verify_calendar_access(self) -> None:
         """Fail fast if the calendar ID is invalid or not shared with the service account."""
         try:
-            info = self.service.calendars().get(calendarId=self.calendar_id).execute(num_retries=2)
-            logger.info(f"Google Calendar ready: {info.get('summary')} ({self.calendar_id})")
+            info = self.service.calendars().get(
+                calendarId=self.calendar_id).execute(num_retries=2)
+            logger.info(
+                f"Google Calendar ready: {info.get('summary')} ({self.calendar_id})")
         except HttpError as he:
             status = getattr(he.resp, 'status', None)
             if status in (403, 404):
@@ -130,7 +137,6 @@ class AppointmentManager:
     def _month_window(self, ref: Optional[datetime] = None) -> tuple[datetime, datetime]:
         ref = ref or self._now()
         start = ref.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        # next month start
         if start.month == 12:
             next_start = start.replace(year=start.year + 1, month=1)
         else:
@@ -144,7 +150,7 @@ class AppointmentManager:
         return dt.isoformat()
 
     # Search helpers
-    def _list_events(self, time_min: datetime, time_max: datetime, q: Optional[str] = None, 
+    def _list_events(self, time_min: datetime, time_max: datetime, q: Optional[str] = None,
                      filter_func: Optional[Callable[[dict], bool]] = None) -> List[dict]:
         events: List[dict] = []
         page_token = None
@@ -187,8 +193,8 @@ class AppointmentManager:
                 filter_func=lambda e: (
                     e.get('status') != 'cancelled' and (
                         e.get('extendedProperties', {})
-                         .get('private', {})
-                         .get('user_key') == user_key
+                        .get('private', {})
+                        .get('user_key') == user_key
                     )
                 )
             )
@@ -196,14 +202,17 @@ class AppointmentManager:
 
     def _has_conflict(self, start: datetime, end: datetime) -> bool:
         # Check for overlapping events in the target window
-        events = self._list_events(start - timedelta(minutes=1), end + timedelta(minutes=1))
+        events = self._list_events(
+            start - timedelta(minutes=1), end + timedelta(minutes=1))
         for e in events:
             e_start_str = e.get('start', {}).get('dateTime')
             e_end_str = e.get('end', {}).get('dateTime')
             if not e_start_str or not e_end_str:
                 continue
-            e_start = datetime.fromisoformat(e_start_str.replace('Z', '+00:00')).astimezone(self.tz)
-            e_end = datetime.fromisoformat(e_end_str.replace('Z', '+00:00')).astimezone(self.tz)
+            e_start = datetime.fromisoformat(
+                e_start_str.replace('Z', '+00:00')).astimezone(self.tz)
+            e_end = datetime.fromisoformat(
+                e_end_str.replace('Z', '+00:00')).astimezone(self.tz)
             latest_start = max(start, e_start)
             earliest_end = min(end, e_end)
             if latest_start < earliest_end:
@@ -212,17 +221,14 @@ class AppointmentManager:
 
     def _next_business_slot(self, start_from: Optional[datetime] = None) -> datetime:
         cur = (start_from or self._now())
-        # Round up to next 30-min slot
         minute = (cur.minute // 30 + 1) * 30
         if minute == 60:
-            cur = cur.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            cur = cur.replace(minute=0, second=0,
+                              microsecond=0) + timedelta(hours=1)
         else:
             cur = cur.replace(minute=minute, second=0, microsecond=0)
-        # Business hours 08:00-13:00 (Atención al público)
         while True:
-            # Skip weekends
             if cur.weekday() >= 5:
-                # move to next Monday 09:00
                 days_ahead = 7 - cur.weekday()
                 cur = cur + timedelta(days=days_ahead)
                 cur = cur.replace(hour=8, minute=0, second=0, microsecond=0)
@@ -230,14 +236,12 @@ class AppointmentManager:
             if cur.hour < 8:
                 cur = cur.replace(hour=8, minute=0, second=0, microsecond=0)
             if cur.hour >= 13:
-                # move to next day 08:00
-                cur = (cur + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+                cur = (cur + timedelta(days=1)).replace(hour=8,
+                                                        minute=0, second=0, microsecond=0)
                 continue
-            # Check conflict
             end = cur + self.duration
             if not self._has_conflict(cur, end):
                 return cur
-            # Move to next slot
             cur = cur + timedelta(minutes=30)
 
     def next_n_slots(self, n: int = 5, start_from: Optional[datetime] = None, day_filter: Optional[int] = None) -> List[datetime]:
@@ -248,17 +252,16 @@ class AppointmentManager:
         while len(slots) < n and guard < 2000:
             guard += 1
             if day_filter is not None and cur.weekday() != day_filter:
-                # jump to next day at 08:00
-                cur = (cur + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+                cur = (cur + timedelta(days=1)).replace(hour=8,
+                                                        minute=0, second=0, microsecond=0)
                 cur = self._next_business_slot(cur)
                 continue
             if self._validate_business_time(cur) and not self._has_conflict(cur, cur + self.duration):
                 slots.append(cur)
-            # advance 30 minutes
             cur = cur + timedelta(minutes=30)
-            # roll over end of day to next day start
             if cur.hour >= 13:
-                cur = (cur + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+                cur = (cur + timedelta(days=1)).replace(hour=8,
+                                                        minute=0, second=0, microsecond=0)
                 cur = self._next_business_slot(cur)
         return slots
 
@@ -270,19 +273,22 @@ class AppointmentManager:
             return False
         return True
 
-    def book_at(self, user_key: str, when: datetime) -> Dict[str, Any]:
+    def book(self, user_key: str, when: Optional[datetime]) -> Dict[str, Any]:
         # Enforce monthly limit; if over limit, return a specific code so the bot can prompt user
         monthly = self._user_events_in_month(user_key)
         if len(monthly) >= 3:
             return {"success": False, "code": "MONTHLY_CAP", "message": "Has alcanzado el límite de 3 citas este mes."}
-        if not self._validate_business_time(when):
-            return {"success": False, "message": "El horario de atención es de lunes a viernes de 8:00 a.m. a 1:00 p.m."}
-        # Round to nearest 30-min slot
-        minute = (when.minute // 30) * 30
-        when = when.replace(minute=minute, second=0, microsecond=0)
-        end = when + self.duration
-        if self._has_conflict(when, end):
-            return {"success": False, "message": "Ese horario no está disponible. ¿Deseas el siguiente disponible?"}
+        if when is None:
+            when = self._next_business_slot()
+        else:
+            if not self._validate_business_time(when):
+                return {"success": False, "message": "El horario de atención es de lunes a viernes de 8:00 a.m. a 1:30 p.m."}
+            # Round to nearest 30-min slot
+            minute = (when.minute // 30) * 30
+            when = when.replace(minute=minute, second=0, microsecond=0)
+            end = when + self.duration
+            if self._has_conflict(when, end):
+                return {"success": False, "message": "Ese horario no está disponible. ¿Deseas el siguiente disponible?"}
         created = self.service.events().insert(
             calendarId=self.calendar_id,
             body=self._event_payload(user_key, when)
@@ -313,22 +319,6 @@ class AppointmentManager:
             }
         }
 
-    def book(self, user_key: str) -> Dict[str, Any]:
-        # Enforce monthly limit; return code so bot can prompt to cancel
-        monthly = self._user_events_in_month(user_key)
-        if len(monthly) >= 3:
-            return {"success": False, "code": "MONTHLY_CAP", "message": "Has alcanzado el límite de 3 citas este mes."}
-        # Find next available slot and create event
-        when = self._next_business_slot()
-        body = self._event_payload(user_key, when)
-        created = self.service.events().insert(calendarId=self.calendar_id, body=body).execute(num_retries=2)
-        start_dt = when.strftime('%d/%m/%Y %H:%M')
-        return {
-            "success": True,
-            "message": f"Cita confirmada para {start_dt}. ID: {created.get('id')}",
-            "event": created,
-        }
-
     def cancel_next(self, user_key: str) -> Dict[str, Any]:
         # Find next upcoming event for this phone and delete it
         now = self._now()
@@ -338,21 +328,22 @@ class AppointmentManager:
                 filter_func=lambda e: (
                     e.get('status') != 'cancelled' and (
                         e.get('extendedProperties', {})
-                         .get('private', {})
-                         .get('user_key') == user_key
+                        .get('private', {})
+                        .get('user_key') == user_key
                     )
                 )
             )
         ]
         if not upcoming:
             return {"success": False, "message": "No tienes ninguna cita programada."}
-        # pick the earliest upcoming
+
         def start_of(e):
             s = e.get('start', {}).get('dateTime')
             return datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(self.tz)
         upcoming.sort(key=start_of)
         target = upcoming[0]
-        self.service.events().delete(calendarId=self.calendar_id, eventId=target['id']).execute(num_retries=2)
+        self.service.events().delete(calendarId=self.calendar_id,
+                                     eventId=target['id']).execute(num_retries=2)
         return {"success": True, "message": f"Cita {target['id']} cancelada exitosamente."}
 
     def cancel_all(self, user_key: str) -> Dict[str, Any]:
@@ -363,7 +354,8 @@ class AppointmentManager:
         count = 0
         for e in upcoming:
             try:
-                self.service.events().delete(calendarId=self.calendar_id, eventId=e['id']).execute(num_retries=2)
+                self.service.events().delete(calendarId=self.calendar_id,
+                                             eventId=e['id']).execute(num_retries=2)
                 count += 1
             except Exception:
                 pass
@@ -377,14 +369,15 @@ class AppointmentManager:
                 filter_func=lambda e: (
                     e.get('status') != 'cancelled' and (
                         e.get('extendedProperties', {})
-                         .get('private', {})
-                         .get('user_key') == user_key
+                        .get('private', {})
+                        .get('user_key') == user_key
                     )
                 )
             )
         ]
         if not upcoming:
             return {"success": False, "message": "No tienes ninguna cita programada."}
+
         def start_of(e):
             s = e.get('start', {}).get('dateTime')
             return datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(self.tz)
@@ -399,15 +392,17 @@ class AppointmentManager:
     def list_upcoming(self, user_key: str) -> List[dict]:
         """Return all upcoming events sorted by start time."""
         events = self._upcoming_user_events(user_key)
+
         def start_of(e):
             s = e.get('start', {}).get('dateTime')
             return datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(self.tz)
         events.sort(key=start_of)
         return events
 
+
 class ConsulateBot:
     """Main chatbot class-- handles OpenAI, Twilio, and appointments"""
-    
+
     def __init__(self, config: Config):
         self.config = config
         # Log masked API key presence to help diagnose auth issues
@@ -421,16 +416,14 @@ class ConsulateBot:
         self.openai_client = OpenAI(
             api_key=config.OPENAI_API_KEY
         )
-        # Optional request timeout for OpenAI calls (seconds)
         try:
             self.openai_timeout = int(os.environ.get('OPENAI_TIMEOUT', '12'))
         except Exception:
             self.openai_timeout = 12
         self.threads = {}  # In-memory message history per user id
         self.max_history = 2  # messages to keep per user
-        self.twilio_client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
-    # No separate intent detector; we use a single-model interpreter per message
-        # Short-lived pending actions per user (e.g., cap cancel -> then proceed)
+        self.twilio_client = Client(
+            config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
         self.pending_actions: Dict[str, Dict[str, Any]] = {}
         # Quick auth check; only disable client on real auth errors
         try:
@@ -439,12 +432,14 @@ class ConsulateBot:
         except Exception as e:
             msg = str(e)
             logger.error(f"OpenAI auth check failed: {msg}")
-            auth_error = ("Missing bearer" in msg) or ("401" in msg) or ("invalid_api_key" in msg)
+            auth_error = ("Missing bearer" in msg) or (
+                "401" in msg) or ("invalid_api_key" in msg)
             if auth_error:
                 self.openai_client = None
                 # Interpreter will be disabled implicitly when openai_client is None
             else:
-                logger.warning("Proceeding with OpenAI client despite healthcheck error (non-auth).")
+                logger.warning(
+                    "Proceeding with OpenAI client despite healthcheck error (non-auth).")
         try:
             self.appointments = AppointmentManager(config)
         except Exception as e:
@@ -453,9 +448,11 @@ class ConsulateBot:
         # Load PDF once for grounding
         try:
             self.pdf_path = Path(__file__).parent / 'consulate_information.pdf'
-            self.pdf_corpus = self._load_pdf_text(self.pdf_path) if self.pdf_path.exists() else ""
+            self.pdf_corpus = self._load_pdf_text(
+                self.pdf_path) if self.pdf_path.exists() else ""
             if self.pdf_corpus:
-                logger.info(f"Loaded consulate_information.pdf for grounding: {len(self.pdf_corpus)} chars")
+                logger.info(
+                    f"Loaded consulate_information.pdf for grounding: {len(self.pdf_corpus)} chars")
             else:
                 logger.warning("PDF file not found or empty")
         except Exception as e:
@@ -518,10 +515,7 @@ class ConsulateBot:
                 texts.append(page.extract_text() or "")
             except Exception:
                 continue
-        # Light cleanup
         return "\n".join(t.strip() for t in texts if t.strip())[:120_000]
-
-    # Paragraph splitting not needed with full-PDF grounding
 
     def _retrieve_context(self, query: str, k: int = 8) -> str:
         """Small PDF path: always return the full corpus (capped) so answers work if the PDF changes."""
@@ -535,14 +529,11 @@ class ConsulateBot:
         logger.info("Using full PDF corpus as context")
         return (self.pdf_corpus or "")[:6000]
 
-    # Removed deterministic extractors; always answer from PDF context with the model
-
     def _normalize_phone(self, raw: str) -> str:
         """Extract digits so WhatsApp/SMS prefixes don't fragment identity."""
         digits = ''.join(ch for ch in (raw or '') if ch.isdigit())
         if digits:
             return digits
-        # Fall back to a short stable hash if we don't have digits (e.g., some channel IDs)
         h = hashlib.sha256((raw or '').encode('utf-8')).hexdigest()
         return h[:24]
 
@@ -552,7 +543,6 @@ class ConsulateBot:
             if not comp or not getattr(comp, "choices", None):
                 return ""
             choice = comp.choices[0]
-            # Log finish reason and usage if available
             try:
                 fr = getattr(choice, "finish_reason", None)
                 usage = getattr(comp, "usage", None)
@@ -565,53 +555,23 @@ class ConsulateBot:
             content = getattr(msg, "content", None)
             if isinstance(content, str):
                 return content.strip()
-            # Some SDKs may return list of parts
             if isinstance(content, list):
-                text_parts = [p.get("text", "") if isinstance(p, dict) else str(p) for p in content]
+                text_parts = [p.get("text", "") if isinstance(
+                    p, dict) else str(p) for p in content]
                 return "\n".join(t for t in text_parts if t).strip()
             return ""
         except Exception:
             return ""
 
-    def _interpret_appointment_intent(self, text: str) -> Optional[Dict[str, Any]]:
-        """Use the LLM to parse free-form user text into a structured appointment command.
-        Returns dict like { action: 'book'|'cancel'|'check'|'availability'|'cancel_all', when_iso?: str }.
-        """
-        if not self.openai_client:
-            return None
-        try:
-            comp = self.openai_client.chat.completions.create(
-                model="gpt-5-nano",
-        messages=[
-                    {"role": "system", "content": (
-                        "You convert user messages about appointments into a strict JSON. "
-            "Allowed actions: book, cancel, check, availability, cancel_all, list. "
-                        "If a date/time is mentioned, include when_iso in ISO 8601 (YYYY-MM-DDTHH:MM) without timezone. "
-                        "If the user wants to cancel a specific appointment, set action=cancel and when_iso. "
-                        "If they want to cancel all appointments, action=cancel_all. "
-                        "Language can be English or Spanish. Output only JSON."
-                    )},
-                    {"role": "user", "content": text[:500]},
-                ]
-            )
-            raw = self._extract_text_reply(comp)
-            if not raw:
-                return None
-            data = json.loads(raw)
-            return data if isinstance(data, dict) else None
-        except Exception:
-            return None
-
     def _parse_requested_time(self, text: str) -> Optional[datetime]:
+        # Backup in case of wrong ai datetime output format
         """Parse simple requests like 'monday at 1', '8/25 at 1:00 p', 'lunes 1pm', 'today 10', 'tomorrow at noon'."""
         t = (text or "").lower()
         now = datetime.now(ZoneInfo(self.config.TIMEZONE))
-        # Try explicit date like 8/25 or 08/25/2025
         m = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", t)
         hour = None
         minute = 0
         ampm = None
-        # 'noon' and 'mediodia'
         if "noon" in t or "medio" in t:
             hour = 12
             minute = 0
@@ -625,14 +585,14 @@ class ConsulateBot:
             hour = int(hm.group(1))
             minute = int(hm.group(2) or 0)
             ampm = (hm.group(3) or "").replace(".", "")
-        # Weekday names
-        weekdays_en = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
-        weekdays_es = ["lunes","martes","miercoles","miércoles","jueves","viernes","sabado","sábado","domingo"]
+        weekdays_en = ["monday", "tuesday", "wednesday",
+                       "thursday", "friday", "saturday", "sunday"]
+        weekdays_es = ["lunes", "martes", "miercoles", "miércoles",
+                       "jueves", "viernes", "sabado", "sábado", "domingo"]
         wd_idx = None
-        # today/tomorrow
-        if any(w in t for w in ["today","hoy"]):
+        if any(w in t for w in ["today", "hoy"]):
             wd_idx = now.weekday()
-        elif any(w in t for w in ["tomorrow","mañana"]):
+        elif any(w in t for w in ["tomorrow", "mañana"]):
             wd_idx = (now.weekday() + 1) % 7
         for i, name in enumerate(weekdays_en):
             if name in t:
@@ -641,8 +601,8 @@ class ConsulateBot:
         if wd_idx is None:
             for i, name in enumerate(weekdays_es):
                 if name in t:
-                    # map spanish to python weekday index
-                    mapping = {"lunes":0,"martes":1,"miercoles":2,"miércoles":2,"jueves":3,"viernes":4,"sabado":5,"sábado":5,"domingo":6}
+                    mapping = {"lunes": 0, "martes": 1, "miercoles": 2, "miércoles": 2,
+                               "jueves": 3, "viernes": 4, "sabado": 5, "sábado": 5, "domingo": 6}
                     wd_idx = mapping[name]
                     break
         # Compute base date
@@ -662,7 +622,8 @@ class ConsulateBot:
             days_ahead = (wd_idx - now.weekday()) % 7
             if days_ahead == 0 and hour is not None and (now.hour > hour):
                 days_ahead = 7
-            dt_date = (now + timedelta(days=days_ahead)).replace(hour=0, minute=0, second=0, microsecond=0)
+            dt_date = (now + timedelta(days=days_ahead)
+                       ).replace(hour=0, minute=0, second=0, microsecond=0)
         else:
             return None
         # Time component
@@ -685,8 +646,8 @@ class ConsulateBot:
         parts = [p.strip() for p in parts if p and len(p.strip()) > 5]
         if not parts:
             return ""
-        # Prefer sentences that include any query tokens
         words = [w for w in re.findall(r"\w+", q) if len(w) > 3]
+
         def score(sent: str) -> int:
             s = sent.lower()
             return sum(1 for w in set(words) if w in s)
@@ -710,9 +671,7 @@ class ConsulateBot:
             return "Exiting the chat. Goodbye!"
         try:
             user_key = self._normalize_phone(phone_number)
-            # Handle pending ephemeral flows (e.g., monthly-cap cancel selection)
             pend = self.pending_actions.get(user_key)
-            # Enforce TTL (15 minutes) for pending actions
             if pend and isinstance(pend, dict):
                 try:
                     ts_str = pend.get("ts")
@@ -736,21 +695,22 @@ class ConsulateBot:
                         try:
                             ev = events[idx]
                             ev_id = ev.get('id')
-                            self.appointments.service.events().delete(calendarId=self.appointments.calendar_id, eventId=ev_id).execute()
-                            # Clear pending
+                            self.appointments.service.events().delete(
+                                calendarId=self.appointments.calendar_id, eventId=ev_id).execute()
                             self.pending_actions.pop(user_key, None)
-                            # Proceed with the queued action if any
                             next_action = pend.get("next_action", {})
                             act = (next_action.get("action") or "").lower()
                             when_iso = next_action.get("when_iso")
                             when_dt = None
                             if when_iso:
                                 try:
-                                    when_dt = datetime.fromisoformat(when_iso).replace(tzinfo=ZoneInfo(self.config.TIMEZONE))
+                                    when_dt = datetime.fromisoformat(when_iso).replace(
+                                        tzinfo=ZoneInfo(self.config.TIMEZONE))
                                 except Exception:
                                     when_dt = None
                             if act == "book" and when_dt:
-                                res = self.appointments.book_at(user_key, when_dt)
+                                res = self.appointments.book(
+                                    user_key, when_dt)
                                 return res.get("message", "Listo.")
                             if act == "book":
                                 res = self.appointments.book(user_key)
@@ -763,25 +723,29 @@ class ConsulateBot:
                     lines = []
                     for i, e in enumerate(pend.get("events", []), start=1):
                         s = e.get('start', {}).get('dateTime')
-                        dt = datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
-                        lines.append(f"{i}) {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
+                        dt = datetime.fromisoformat(
+                            s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
+                        lines.append(
+                            f"{i}) {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
                     return "Selecciona 1, 2 o 3 para cancelar y continuar:\n" + "\n".join(lines)
                 elif sel in {"no", "n", "cancel", "cancelar"}:
                     self.pending_actions.pop(user_key, None)
                     return "Entendido, no se canceló ninguna cita."
                 # If reply doesn't match, fall through to normal processing but keep pending alive
             # Quick path: allow "cancel <ID>" to remove a specific event (supports cap-prompt flow)
-            # Quick path: allow "cancel <ID>" to remove a specific event (supports cap-prompt flow)
             if self.appointments:
-                m = re.search(r"\bcancel(?:ar)?\s+([A-Za-z0-9_\-@]+)\b", incoming_msg, flags=re.IGNORECASE)
+                m = re.search(
+                    r"\bcancel(?:ar)?\s+([A-Za-z0-9_\-@]+)\b", incoming_msg, flags=re.IGNORECASE)
                 if m:
                     target_id = m.group(1)
                     # Ensure the event belongs to this user
-                    upcoming = self.appointments._upcoming_user_events(user_key)
+                    upcoming = self.appointments._upcoming_user_events(
+                        user_key)
                     for e in upcoming:
                         if e.get('id') == target_id:
                             try:
-                                self.appointments.service.events().delete(calendarId=self.appointments.calendar_id, eventId=target_id).execute()
+                                self.appointments.service.events().delete(
+                                    calendarId=self.appointments.calendar_id, eventId=target_id).execute()
                                 return f"Cita {target_id} cancelada exitosamente."
                             except Exception:
                                 break
@@ -797,7 +761,8 @@ class ConsulateBot:
                 if when_iso:
                     try:
                         base = datetime.fromisoformat(when_iso)
-                        when_dt = base.replace(tzinfo=ZoneInfo(self.config.TIMEZONE))
+                        when_dt = base.replace(
+                            tzinfo=ZoneInfo(self.config.TIMEZONE))
                     except Exception:
                         when_dt = self._parse_requested_time(incoming_msg)
                 if action == "cancel_all":
@@ -806,19 +771,22 @@ class ConsulateBot:
                 if action == "cancel":
                     if when_dt:
                         # cancel the matching appointment (closest at that time)
-                        upcoming = self.appointments._upcoming_user_events(user_key)
+                        upcoming = self.appointments._upcoming_user_events(
+                            user_key)
                         target_id = None
                         for e in upcoming:
                             s = e.get('start', {}).get('dateTime')
                             if not s:
                                 continue
-                            sdt = datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
+                            sdt = datetime.fromisoformat(
+                                s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
                             # match same day and hour
                             if sdt.date() == when_dt.date() and sdt.hour == when_dt.hour and sdt.minute == when_dt.minute:
                                 target_id = e['id']
                                 break
                         if target_id:
-                            self.appointments.service.events().delete(calendarId=self.appointments.calendar_id, eventId=target_id).execute()
+                            self.appointments.service.events().delete(
+                                calendarId=self.appointments.calendar_id, eventId=target_id).execute()
                             return f"Cita {target_id} cancelada exitosamente."
                         # fallback to next
                     res = self.appointments.cancel_next(user_key)
@@ -831,8 +799,10 @@ class ConsulateBot:
                     lines = []
                     for e in events:
                         s = e.get('start', {}).get('dateTime')
-                        dt = datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
-                        lines.append(f"• {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
+                        dt = datetime.fromisoformat(
+                            s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
+                        lines.append(
+                            f"• {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
                     return "Tus citas programadas:\n" + "\n".join(lines)
                 if action == "list":
                     events = self.appointments.list_upcoming(user_key)
@@ -841,14 +811,16 @@ class ConsulateBot:
                     lines = []
                     for e in events:
                         s = e.get('start', {}).get('dateTime')
-                        dt = datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
-                        lines.append(f"• {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
+                        dt = datetime.fromisoformat(
+                            s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
+                        lines.append(
+                            f"• {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
                     return "Tus citas programadas:\n" + "\n".join(lines)
                 if action == "availability":
                     # Suggest next 5 or constrained by weekday if mentioned
                     t = incoming_msg.lower()
-                    mapping = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,
-                               "lunes":0,"martes":1,"miercoles":2,"miércoles":2,"jueves":3,"viernes":4}
+                    mapping = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4,
+                               "lunes": 0, "martes": 1, "miercoles": 2, "miércoles": 2, "jueves": 3, "viernes": 4}
                     day_filter = None
                     for k, v in mapping.items():
                         if k in t:
@@ -860,19 +832,23 @@ class ConsulateBot:
                         days_ahead = (7 - now.weekday()) % 7
                         if days_ahead == 0:
                             days_ahead = 7
-                        start_from = (now + timedelta(days=days_ahead)).replace(hour=8, minute=0, second=0, microsecond=0)
-                    slots = self.appointments.next_n_slots(5, start_from=start_from, day_filter=day_filter)
+                        start_from = (now + timedelta(days=days_ahead)
+                                      ).replace(hour=8, minute=0, second=0, microsecond=0)
+                    slots = self.appointments.next_n_slots(
+                        5, start_from=start_from, day_filter=day_filter)
                     if not slots:
                         return "No encuentro horarios disponibles en este momento dentro del horario de atención (8:00 a 13:00)."
                     fmt = [s.strftime('%A %d/%m %H:%M') for s in slots]
                     return "Próximos horarios disponibles: " + "; ".join(fmt)
                 if action == "book":
                     if when_dt:
-                        result = self.appointments.book_at(user_key, when_dt)
+                        result = self.appointments.book(user_key, when_dt)
                         if result.get("code") == "MONTHLY_CAP":
                             # Present this month's appointments as 1/2/3 and store pending next action
-                            month_events = self.appointments._user_events_in_month(user_key)
-                            evs = month_events or self.appointments.list_upcoming(user_key)
+                            month_events = self.appointments._user_events_in_month(
+                                user_key)
+                            evs = month_events or self.appointments.list_upcoming(
+                                user_key)
                             if evs:
                                 self.pending_actions[user_key] = {
                                     "type": "cap_cancel",
@@ -883,19 +859,25 @@ class ConsulateBot:
                                 lines = []
                                 for i, e in enumerate(evs[:3], start=1):
                                     s = e.get('start', {}).get('dateTime')
-                                    dt = datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
-                                    lines.append(f"{i}) {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
+                                    dt = datetime.fromisoformat(
+                                        s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
+                                    lines.append(
+                                        f"{i}) {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
                                 return "Ya tienes 3 citas este mes. Responde 1, 2 o 3 para cancelar una y continuar con tu nueva reserva:\n" + "\n".join(lines)
                         if not result.get("success") and "no está disponible" in (result.get("message", "").lower()):
-                            slots = self.appointments.next_n_slots(5, start_from=when_dt)
+                            slots = self.appointments.next_n_slots(
+                                5, start_from=when_dt)
                             if slots:
-                                opts = "; ".join(s.strftime('%A %d/%m %H:%M') for s in slots)
+                                opts = "; ".join(s.strftime(
+                                    '%A %d/%m %H:%M') for s in slots)
                                 result["message"] += f" Opciones cercanas: {opts}."
                     else:
                         result = self.appointments.book(user_key)
                         if result.get("code") == "MONTHLY_CAP":
-                            month_events = self.appointments._user_events_in_month(user_key)
-                            evs = month_events or self.appointments.list_upcoming(user_key)
+                            month_events = self.appointments._user_events_in_month(
+                                user_key)
+                            evs = month_events or self.appointments.list_upcoming(
+                                user_key)
                             if evs:
                                 self.pending_actions[user_key] = {
                                     "type": "cap_cancel",
@@ -906,8 +888,10 @@ class ConsulateBot:
                                 lines = []
                                 for i, e in enumerate(evs[:3], start=1):
                                     s = e.get('start', {}).get('dateTime')
-                                    dt = datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
-                                    lines.append(f"{i}) {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
+                                    dt = datetime.fromisoformat(
+                                        s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
+                                    lines.append(
+                                        f"{i}) {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
                                 return "Ya tienes 3 citas este mes. Responde 1, 2 o 3 para cancelar una y continuar:\n" + "\n".join(lines)
                     return result["message"]
             # 2) If mode=answer
@@ -943,10 +927,11 @@ class ConsulateBot:
                 "No pude generar una respuesta en este momento. Intenta reformular la pregunta o "
                 "pídeme programar, verificar o cancelar una cita."
             )
-            
+
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}")
             return "Lo siento, hubo un error procesando tu mensaje. Por favor, intenta de nuevo más tarde."
+
 
 def create_app(config: Config) -> Flask:
     """Create Flask application"""
@@ -966,18 +951,20 @@ def create_app(config: Config) -> Flask:
         """Unified webhook for SMS/WhatsApp"""
         try:
             # Validate Twilio signature unless disabled
-            if os.environ.get('SKIP_TWILIO_VALIDATION', '').lower() not in {'1','true','yes'}:
+            if os.environ.get('SKIP_TWILIO_VALIDATION', '').lower() not in {'1', 'true', 'yes'}:
                 signature = request.headers.get('X-Twilio-Signature', '')
                 validator = RequestValidator(config.TWILIO_AUTH_TOKEN)
-                # Some platforms require reconstructing original URL behind proxies
-                scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
+                scheme = request.headers.get(
+                    'X-Forwarded-Proto', request.scheme)
                 host = request.headers.get('X-Forwarded-Host', request.host)
                 path = request.path
                 reconstructed_url = f"{scheme}://{host}{path}"
-                valid = validator.validate(reconstructed_url, request.form, signature)
+                valid = validator.validate(
+                    reconstructed_url, request.form, signature)
                 if not valid:
-                    # Fallback: try request.url (may include query string)
-                    valid = validator.validate(request.url, request.form, signature)
+                    # Fallback: try request.url
+                    valid = validator.validate(
+                        request.url, request.form, signature)
                 if not valid:
                     logger.warning("Twilio signature validation failed")
                     return ("Forbidden", 403)
@@ -989,10 +976,12 @@ def create_app(config: Config) -> Flask:
         except Exception as e:
             logger.error(f"Error in webhook handler: {str(e)}")
             response = MessagingResponse()
-            response.message("Lo siento, ocurrió un error. Por favor, intenta de nuevo más tarde.")
+            response.message(
+                "Lo siento, ocurrió un error. Por favor, intenta de nuevo más tarde.")
             return str(response)
 
     return app
+
 
 def main():
     """Application entry point"""
@@ -1004,6 +993,7 @@ def main():
     except Exception as e:
         logger.critical(f"Failed to start application: {str(e)}")
         raise
+
 
 if __name__ == '__main__':
     main()
