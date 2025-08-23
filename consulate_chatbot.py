@@ -104,8 +104,8 @@ class AppointmentManager:
                     logger.info(f"Google service account: {sa_email}")
             except Exception:
                 pass
-            http = httplib2.Http(timeout=10)
-            return build('calendar', 'v3', credentials=creds, cache_discovery=False, http=http)
+            # Use default HTTP transport; do not pass both http and credentials (mutually exclusive)
+            return build('calendar', 'v3', credentials=creds, cache_discovery=False)
         except Exception as e:
             logger.error(f"Google Calendar auth/build error: {e}")
             raise
@@ -965,13 +965,22 @@ def create_app(config: Config) -> Flask:
     def webhook_reply() -> str:
         """Unified webhook for SMS/WhatsApp"""
         try:
-            # Validate Twilio signature
-            signature = request.headers.get('X-Twilio-Signature', '')
-            validator = RequestValidator(config.TWILIO_AUTH_TOKEN)
-            url = request.url  # full URL of this request
-            if not validator.validate(url, request.form, signature):
-                logger.warning("Twilio signature validation failed")
-                return ("Forbidden", 403)
+            # Validate Twilio signature unless disabled
+            if os.environ.get('SKIP_TWILIO_VALIDATION', '').lower() not in {'1','true','yes'}:
+                signature = request.headers.get('X-Twilio-Signature', '')
+                validator = RequestValidator(config.TWILIO_AUTH_TOKEN)
+                # Some platforms require reconstructing original URL behind proxies
+                scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
+                host = request.headers.get('X-Forwarded-Host', request.host)
+                path = request.path
+                reconstructed_url = f"{scheme}://{host}{path}"
+                valid = validator.validate(reconstructed_url, request.form, signature)
+                if not valid:
+                    # Fallback: try request.url (may include query string)
+                    valid = validator.validate(request.url, request.form, signature)
+                if not valid:
+                    logger.warning("Twilio signature validation failed")
+                    return ("Forbidden", 403)
             incoming_msg = request.values.get('Body', '').strip()
             phone_number = request.values.get('From', '')
             response = MessagingResponse()
