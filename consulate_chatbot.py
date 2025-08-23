@@ -105,6 +105,14 @@ class IntentDetector:
         r"\bwhen is my appointment\b",
         r"\bstatus\b",
     ]
+    LIST_PATTERNS = [
+        r"\ball (my )?appointments\b",
+        r"\blist( (my )?appointments)?\b",
+        r"\bver (todas|todas mis) citas\b",
+        r"\btodas mis citas\b",
+        r"\blistar citas\b",
+        r"\blista de citas\b",
+    ]
     AVAIL_PATTERNS = [
     r"\bavailable\b",
     r"\bavailability\b",
@@ -134,42 +142,32 @@ class IntentDetector:
 
         
     def classify(self, text: str) -> Dict[str, Any]:
-        t = (text or "").lower()
-        def any_match(patterns: List[str]) -> bool:
-            return any(re.search(p, t) for p in patterns)
-        # Prefer availability over booking if user asks about open times
-        if any_match(self.AVAIL_PATTERNS):
-            return {"intent": "appointment_availability", "confidence": 0.95}
-        if any_match(self.BOOK_PATTERNS):
-            return {"intent": "appointment_request", "confidence": 0.9}
-        if any_match(self.CANCEL_PATTERNS):
-            return {"intent": "appointment_cancel", "confidence": 0.95}
-        if any_match(self.CHECK_PATTERNS):
-            return {"intent": "appointment_check", "confidence": 0.9}
-        # Fallback to a tiny model if available
+        # Model-only classification for flexibility in production
         if self.client:
             try:
                 comp = self.client.chat.completions.create(
                     model="gpt-5-nano",
                     messages=[
                         {"role": "system", "content": (
-                            "Classify this user message intent for a consulate bot. Output strict JSON with keys 'intent' and 'confidence' (0-1). "
-                            "Intents: appointment_request, appointment_cancel, appointment_check, appointment_availability, general_inquiry. "
-                            "User may write in English or Spanish."
+                            "Classify this user message into a consulate intent. Output strict JSON: {\"intent\": <string>, \"confidence\": <0-1>}. "
+                            "Intents: appointment_request, appointment_cancel, appointment_check, appointment_availability, appointment_list, appointment_cancel_all, general_inquiry. "
+                            "If it's about appointments (citas) in any way, choose the closest appointment_* intent. English or Spanish."
                         )},
-                        {"role": "user", "content": text[:400]}
+                        {"role": "user", "content": (text or "")[:500]}
                     ]
                 )
                 raw = comp.choices[0].message.content
                 data = json.loads(raw)
                 intent = data.get("intent", "general_inquiry")
                 conf = float(data.get("confidence", 0.6))
-                if intent not in {"appointment_request", "appointment_cancel", "appointment_check", "appointment_availability", "general_inquiry"}:
+                allowed = {"appointment_request", "appointment_cancel", "appointment_check", "appointment_availability", "appointment_list", "appointment_cancel_all", "general_inquiry"}
+                if intent not in allowed:
                     intent = "general_inquiry"
                 return {"intent": intent, "confidence": conf}
             except Exception:
-                pass
-        return {"intent": "general_inquiry", "confidence": 0.6}
+                return {"intent": "general_inquiry", "confidence": 0.5}
+        # If model not available, default to general_inquiry
+        return {"intent": "general_inquiry", "confidence": 0.5}
 
 
 class AppointmentManager:
@@ -374,24 +372,10 @@ class AppointmentManager:
         return True
 
     def book_at(self, user_key: str, when: datetime) -> Dict[str, Any]:
-        # Enforce monthly limit; if over limit, propose auto-cancel oldest upcoming and book
+        # Enforce monthly limit; if over limit, return a specific code so the bot can prompt user
         monthly = self._user_events_in_month(user_key)
         if len(monthly) >= 3:
-            # Try to cancel the oldest upcoming appointment and proceed
-            upcoming = self._upcoming_user_events(user_key)
-            if upcoming:
-                def start_of(e):
-                    s = e.get('start', {}).get('dateTime')
-                    return datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(self.tz)
-                upcoming.sort(key=start_of)
-                oldest = upcoming[0]
-                try:
-                    self.service.events().delete(calendarId=self.calendar_id, eventId=oldest['id']).execute()
-                    logger.info(f"Auto-cancelled oldest event {oldest['id']} to respect monthly cap")
-                except Exception:
-                    return {"success": False, "message": "Has alcanzado el límite de 3 citas este mes. Cancela una cita existente para continuar."}
-            else:
-                return {"success": False, "message": "Has alcanzado el límite de 3 citas este mes. Cancela una cita existente para continuar."}
+            return {"success": False, "code": "MONTHLY_CAP", "message": "Has alcanzado el límite de 3 citas este mes."}
         if not self._validate_business_time(when):
             return {"success": False, "message": "El horario de atención es de lunes a viernes de 8:00 a.m. a 1:00 p.m."}
         # Round to nearest 30-min slot
@@ -424,23 +408,10 @@ class AppointmentManager:
         }
 
     def book(self, user_key: str) -> Dict[str, Any]:
-        # Enforce monthly limit; auto-cancel oldest upcoming if necessary
+        # Enforce monthly limit; return code so bot can prompt to cancel
         monthly = self._user_events_in_month(user_key)
         if len(monthly) >= 3:
-            upcoming = self._upcoming_user_events(user_key)
-            if upcoming:
-                def start_of(e):
-                    s = e.get('start', {}).get('dateTime')
-                    return datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(self.tz)
-                upcoming.sort(key=start_of)
-                oldest = upcoming[0]
-                try:
-                    self.service.events().delete(calendarId=self.calendar_id, eventId=oldest['id']).execute()
-                    logger.info(f"Auto-cancelled oldest event {oldest['id']} to respect monthly cap")
-                except Exception:
-                    return {"success": False, "message": "Has alcanzado el límite de 3 citas este mes. Cancela una cita existente para continuar."}
-            else:
-                return {"success": False, "message": "Has alcanzado el límite de 3 citas este mes. Cancela una cita existente para continuar."}
+            return {"success": False, "code": "MONTHLY_CAP", "message": "Has alcanzado el límite de 3 citas este mes."}
         # Find next available slot and create event
         when = self._next_business_slot()
         body = self._event_payload(user_key, when)
@@ -519,6 +490,15 @@ class AppointmentManager:
             "message": f"Tu próxima cita es el {when.strftime('%d/%m/%Y a las %H:%M')}. ID: {first['id']}"
         }
 
+    def list_upcoming(self, user_key: str) -> List[dict]:
+        """Return all upcoming events sorted by start time."""
+        events = self._upcoming_user_events(user_key)
+        def start_of(e):
+            s = e.get('start', {}).get('dateTime')
+            return datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(self.tz)
+        events.sort(key=start_of)
+        return events
+
 class ConsulateBot:
     """Main chatbot class-- handles OpenAI, Twilio, and appointments"""
     
@@ -539,6 +519,8 @@ class ConsulateBot:
         self.max_history = 2  # messages to keep per user
         self.twilio_client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
         self.intent = IntentDetector(self.openai_client)
+        # Short-lived pending actions per user (e.g., cap cancel -> then proceed)
+        self.pending_actions: Dict[str, Dict[str, Any]] = {}
         # Quick auth check; only disable client on real auth errors
         try:
             _ = self.openai_client.models.list()
@@ -564,18 +546,10 @@ class ConsulateBot:
             self.pdf_corpus = self._load_pdf_text(self.pdf_path) if self.pdf_path.exists() else ""
             if self.pdf_corpus:
                 logger.info(f"Loaded consulate_information.pdf for grounding: {len(self.pdf_corpus)} chars")
-                # Pre-build paragraph chunks for better retrieval
-                self._pdf_paragraphs = self._build_pdf_paragraphs(self.pdf_corpus)
-                logger.info(f"Built {len(self._pdf_paragraphs)} PDF paragraphs for retrieval")
-                # Debug: Show first few paragraphs
-                for i, para in enumerate(self._pdf_paragraphs[:3]):
-                    logger.info(f"PDF para {i}: {para[:200]}...")
             else:
                 logger.warning("PDF file not found or empty")
-                self._pdf_paragraphs = []
         except Exception as e:
             logger.warning(f"Failed to load PDF for grounding: {e}")
-            self._pdf_paragraphs = []
 
     def _load_pdf_text(self, path: Path) -> str:
         reader = PdfReader(str(path))
@@ -588,43 +562,7 @@ class ConsulateBot:
         # Light cleanup
         return "\n".join(t.strip() for t in texts if t.strip())[:120_000]
 
-    def _build_pdf_paragraphs(self, corpus: str) -> List[str]:
-        """Build paragraph-like chunks from raw PDF text.
-        Prefer splitting on blank lines; otherwise, create sliding windows of 2-3 lines.
-        """
-        lines = [ln.rstrip() for ln in corpus.splitlines()]
-        # Group by blank lines
-        paras: List[str] = []
-        cur: List[str] = []
-        for ln in lines:
-            if not ln.strip():
-                if cur:
-                    paras.append(" ".join(cur).strip())
-                    cur = []
-            else:
-                cur.append(ln.strip())
-        if cur:
-            paras.append(" ".join(cur).strip())
-        # If the PDF has no blank-line structure, synthesize windows
-        if not paras or len(paras) < 5:
-            win = 3
-            synthesized = []
-            for i in range(0, len(lines), win):
-                chunk = " ".join(ln.strip() for ln in lines[i:i+win] if ln.strip())
-                if chunk:
-                    synthesized.append(chunk)
-            if synthesized:
-                paras = synthesized
-        # De-dup short repeats and keep reasonable length
-        uniq: List[str] = []
-        seen = set()
-        for p in paras:
-            key = p[:120]
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq.append(p[:1200])
-        return uniq
+    # Paragraph splitting not needed with full-PDF grounding
 
     def _retrieve_context(self, query: str, k: int = 8) -> str:
         """Small PDF path: always return the full corpus (capped) so answers work if the PDF changes."""
@@ -685,10 +623,10 @@ class ConsulateBot:
         try:
             comp = self.openai_client.chat.completions.create(
                 model="gpt-5-nano",
-                messages=[
+        messages=[
                     {"role": "system", "content": (
                         "You convert user messages about appointments into a strict JSON. "
-                        "Allowed actions: book, cancel, check, availability, cancel_all. "
+            "Allowed actions: book, cancel, check, availability, cancel_all, list. "
                         "If a date/time is mentioned, include when_iso in ISO 8601 (YYYY-MM-DDTHH:MM) without timezone. "
                         "If the user wants to cancel a specific appointment, set action=cancel and when_iso. "
                         "If they want to cancel all appointments, action=cancel_all. "
@@ -811,12 +749,88 @@ class ConsulateBot:
             if phone_number in self.threads:
                 del self.threads[phone_number]
             return "Exiting the chat. Goodbye!"
-
         try:
-            # 1) Try LLM interpreter for appointment commands first (more flexible than regex)
             user_key = self._normalize_phone(phone_number)
-            cmd = self._interpret_appointment_intent(incoming_msg)
-            if self.appointments and cmd and isinstance(cmd, dict):
+            # Handle pending ephemeral flows (e.g., monthly-cap cancel selection)
+            pend = self.pending_actions.get(user_key)
+            if pend and isinstance(pend, dict):
+                sel = (incoming_msg or "").strip().lower()
+                # Accept simple numeric 1..9 or responses like "opcion 2"
+                mnum = re.match(r"^(?:opci[oó]n\s+)?(\d{1,2})\b", sel)
+                if mnum:
+                    idx = int(mnum.group(1)) - 1
+                    events: List[Dict[str, Any]] = pend.get("events", [])
+                    if 0 <= idx < len(events):
+                        try:
+                            ev = events[idx]
+                            ev_id = ev.get('id')
+                            self.appointments.service.events().delete(calendarId=self.appointments.calendar_id, eventId=ev_id).execute()
+                            # Clear pending
+                            self.pending_actions.pop(user_key, None)
+                            # Proceed with the queued action if any
+                            next_action = pend.get("next_action", {})
+                            act = (next_action.get("action") or "").lower()
+                            when_iso = next_action.get("when_iso")
+                            when_dt = None
+                            if when_iso:
+                                try:
+                                    when_dt = datetime.fromisoformat(when_iso).replace(tzinfo=ZoneInfo(self.config.TIMEZONE))
+                                except Exception:
+                                    when_dt = None
+                            if act == "book" and when_dt:
+                                res = self.appointments.book_at(user_key, when_dt)
+                                return res.get("message", "Listo.")
+                            if act == "book":
+                                res = self.appointments.book(user_key)
+                                return res.get("message", "Listo.")
+                            return f"Cita {ev_id} cancelada. ¿Deseas algo más?"
+                        except Exception as e:
+                            # Do not drop; allow normal flow
+                            self.pending_actions.pop(user_key, None)
+                    # If invalid selection, reprint options
+                    lines = []
+                    for i, e in enumerate(pend.get("events", []), start=1):
+                        s = e.get('start', {}).get('dateTime')
+                        dt = datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
+                        lines.append(f"{i}) {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
+                    return "Selecciona 1, 2 o 3 para cancelar y continuar:\n" + "\n".join(lines)
+                elif sel in {"no", "n", "cancel", "cancelar"}:
+                    self.pending_actions.pop(user_key, None)
+                    return "Entendido, no se canceló ninguna cita."
+                # If reply doesn't match, fall through to normal processing but keep pending alive
+            # Quick path: allow "cancel <ID>" to remove a specific event (supports cap-prompt flow)
+            # Quick path: allow "cancel <ID>" to remove a specific event (supports cap-prompt flow)
+            if self.appointments:
+                m = re.search(r"\bcancel(?:ar)?\s+([A-Za-z0-9_\-@]+)\b", incoming_msg, flags=re.IGNORECASE)
+                if m:
+                    target_id = m.group(1)
+                    # Ensure the event belongs to this user
+                    upcoming = self.appointments._upcoming_user_events(user_key)
+                    for e in upcoming:
+                        if e.get('id') == target_id:
+                            try:
+                                self.appointments.service.events().delete(calendarId=self.appointments.calendar_id, eventId=target_id).execute()
+                                return f"Cita {target_id} cancelada exitosamente."
+                            except Exception:
+                                break
+                    # If not found, continue with normal flow
+            # 1) AI-first: classify with LLM, then delegate to appointment or general pipeline
+            intent = self.intent.classify(incoming_msg)
+            if self.appointments and intent and intent.get("intent", "") != "general_inquiry":
+                # Appointment pipeline: use interpreter to get action and time
+                cmd = self._interpret_appointment_intent(incoming_msg)
+                if not cmd or not cmd.get("action"):
+                    # Derive action from classified intent if interpreter failed
+                    intent_to_action = {
+                        "appointment_request": "book",
+                        "appointment_cancel": "cancel",
+                        "appointment_check": "check",
+                        "appointment_availability": "availability",
+                        "appointment_list": "list",
+                        "appointment_cancel_all": "cancel_all",
+                    }
+                    fallback_action = intent_to_action.get(intent.get("intent", ""), "book")
+                    cmd = {"action": fallback_action}
                 action = (cmd.get("action") or "").lower()
                 when_iso = cmd.get("when_iso")
                 # Parse when_iso if present
@@ -851,8 +865,26 @@ class ConsulateBot:
                     res = self.appointments.cancel_next(user_key)
                     return res["message"]
                 if action == "check":
-                    res = self.appointments.check_next(user_key)
-                    return res["message"]
+                    # List all upcoming instead of only next
+                    events = self.appointments.list_upcoming(user_key)
+                    if not events:
+                        return "No tienes ninguna cita programada."
+                    lines = []
+                    for e in events:
+                        s = e.get('start', {}).get('dateTime')
+                        dt = datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
+                        lines.append(f"• {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
+                    return "Tus citas programadas:\n" + "\n".join(lines)
+                if action == "list":
+                    events = self.appointments.list_upcoming(user_key)
+                    if not events:
+                        return "No tienes ninguna cita programada."
+                    lines = []
+                    for e in events:
+                        s = e.get('start', {}).get('dateTime')
+                        dt = datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
+                        lines.append(f"• {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
+                    return "Tus citas programadas:\n" + "\n".join(lines)
                 if action == "availability":
                     # Suggest next 5 or constrained by weekday if mentioned
                     t = incoming_msg.lower()
@@ -878,6 +910,23 @@ class ConsulateBot:
                 if action == "book":
                     if when_dt:
                         result = self.appointments.book_at(user_key, when_dt)
+                        if result.get("code") == "MONTHLY_CAP":
+                            # Present this month's appointments as 1/2/3 and store pending next action
+                            month_events = self.appointments._user_events_in_month(user_key)
+                            evs = month_events or self.appointments.list_upcoming(user_key)
+                            if evs:
+                                self.pending_actions[user_key] = {
+                                    "type": "cap_cancel",
+                                    "events": evs[:3],
+                                    "next_action": {"action": "book", "when_iso": when_dt.isoformat()},
+                                    "ts": datetime.now(timezone.utc).isoformat(),
+                                }
+                                lines = []
+                                for i, e in enumerate(evs[:3], start=1):
+                                    s = e.get('start', {}).get('dateTime')
+                                    dt = datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
+                                    lines.append(f"{i}) {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
+                                return "Ya tienes 3 citas este mes. Responde 1, 2 o 3 para cancelar una y continuar con tu nueva reserva:\n" + "\n".join(lines)
                         if not result.get("success") and "no está disponible" in (result.get("message", "").lower()):
                             slots = self.appointments.next_n_slots(5, start_from=when_dt)
                             if slots:
@@ -885,71 +934,25 @@ class ConsulateBot:
                                 result["message"] += f" Opciones cercanas: {opts}."
                     else:
                         result = self.appointments.book(user_key)
+                        if result.get("code") == "MONTHLY_CAP":
+                            month_events = self.appointments._user_events_in_month(user_key)
+                            evs = month_events or self.appointments.list_upcoming(user_key)
+                            if evs:
+                                self.pending_actions[user_key] = {
+                                    "type": "cap_cancel",
+                                    "events": evs[:3],
+                                    "next_action": {"action": "book"},
+                                    "ts": datetime.now(timezone.utc).isoformat(),
+                                }
+                                lines = []
+                                for i, e in enumerate(evs[:3], start=1):
+                                    s = e.get('start', {}).get('dateTime')
+                                    dt = datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
+                                    lines.append(f"{i}) {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
+                                return "Ya tienes 3 citas este mes. Responde 1, 2 o 3 para cancelar una y continuar:\n" + "\n".join(lines)
                     return result["message"]
 
-            # 1b) Fallback to regex intents for robustness
-            intent = self.intent.classify(incoming_msg)
-            if self.appointments and intent["confidence"] >= 0.8:
-                if intent["intent"] == "appointment_request":
-                    # Try to parse a requested date/time
-                    requested = self._parse_requested_time(incoming_msg)
-                    if requested:
-                        requested_local = requested.astimezone(ZoneInfo(self.config.TIMEZONE))
-                        result = self.appointments.book_at(user_key, requested_local)
-                        if not result.get("success") and "no está disponible" in (result.get("message", "").lower()):
-                            # Offer five nearby alternatives starting from the requested time
-                            slots = self.appointments.next_n_slots(5, start_from=requested_local)
-                            if slots:
-                                opts = "; ".join(s.strftime('%A %d/%m %H:%M') for s in slots)
-                                result["message"] += f" Opciones cercanas: {opts}."
-                    else:
-                        result = self.appointments.book(user_key)
-                    return result["message"]
-                if intent["intent"] == "appointment_cancel":
-                    result = self.appointments.cancel_next(user_key)
-                    return result["message"]
-                if intent["intent"] == "appointment_cancel_all":
-                    result = self.appointments.cancel_all(user_key)
-                    return result["message"]
-                if intent["intent"] == "appointment_check":
-                    result = self.appointments.check_next(user_key)
-                    return result["message"]
-                if intent["intent"] == "appointment_availability":
-                    # If the user mentions a weekday, filter; otherwise show next 5 slots
-                    t = incoming_msg.lower()
-                    mapping = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,
-                               "lunes":0,"martes":1,"miercoles":2,"miércoles":2,"jueves":3,"viernes":4}
-                    day_filter = None
-                    for k, v in mapping.items():
-                        if k in t:
-                            day_filter = v
-                            break
-                    # Respect "next week" queries by starting from next Monday 08:00
-                    start_from = self.appointments._now()
-                    if any(phrase in t for phrase in [
-                        "next week", "proxima semana", "próxima semana", "semana que viene"
-                    ]):
-                        now = start_from
-                        # Monday=0 .. Sunday=6 -> compute next Monday
-                        days_ahead = (7 - now.weekday()) % 7
-                        if days_ahead == 0:
-                            days_ahead = 7
-                        start_from = (now + timedelta(days=days_ahead)).replace(hour=8, minute=0, second=0, microsecond=0)
-                    slots = self.appointments.next_n_slots(5, start_from=start_from, day_filter=day_filter)
-                    is_english = any(w in t for w in [
-                        "available","availability","opening","openings","slot","what","when","next week","this week",
-                        "monday","tuesday","wednesday","thursday","friday"
-                    ])
-                    if not slots:
-                        return (
-                            "I can't find available times within service hours (8:00–13:00)." if is_english
-                            else "No encuentro horarios disponibles en este momento dentro del horario de atención (8:00 a 13:00)."
-                        )
-                    fmt = [s.strftime('%A %d/%m %H:%M') for s in slots]
-                    return (
-                        "Next available times: " + "; ".join(fmt) if is_english
-                        else "Próximos horarios disponibles: " + "; ".join(fmt)
-                    )
+            # 1b) No regex fallback: if model is unavailable, we go to general/Q&A pathway below
 
             # 2) Fall back to chat completions for general inquiries
             if not self.openai_client:
@@ -959,35 +962,7 @@ class ConsulateBot:
                 )
             history = self.get_or_create_thread(phone_number)
             grounding = self._retrieve_context(incoming_msg)
-            # Short-circuit: if user asks fee for passport renewal and we can extract it from context, answer deterministically
-            if self.config.USE_DETERMINISTIC_EXTRACTORS:
-                try:
-                    if self._is_fee_query(incoming_msg):
-                        fee_ans = self._extract_fee_answer(incoming_msg, grounding)
-                        if fee_ans:
-                            logger.info("Using deterministic fee extractor answer")
-                            # Update minimal history for continuity
-                            history.append({"role": "user", "content": incoming_msg})
-                            history.append({"role": "assistant", "content": fee_ans})
-                            if len(history) > 2 * self.max_history:
-                                del history[: len(history) - 2 * self.max_history]
-                            return fee_ans
-                except Exception:
-                    pass
-            # Short-circuit: passport renewal steps
-            if self.config.USE_DETERMINISTIC_EXTRACTORS:
-                try:
-                    if self._is_passport_renewal_query(incoming_msg):
-                        steps_ans = self._extract_passport_renewal_steps(grounding, incoming_msg)
-                        if steps_ans:
-                            logger.info("Using deterministic passport-steps extractor answer")
-                            history.append({"role": "user", "content": incoming_msg})
-                            history.append({"role": "assistant", "content": steps_ans})
-                            if len(history) > 2 * self.max_history:
-                                del history[: len(history) - 2 * self.max_history]
-                            return steps_ans
-                except Exception:
-                    pass
+            # (Deterministic extractors removed)
 
             system_persona = (
                 "Eres un asistente virtual del consulado. Responde solo a preguntas de servicios consulares "
@@ -1058,19 +1033,6 @@ class ConsulateBot:
                         del history[: len(history) - 2 * self.max_history]
                     logger.info("Using context snippet fallback")
                     return snippet
-                # Try deterministic extraction for passport steps again as a last resort
-                if self.config.USE_DETERMINISTIC_EXTRACTORS:
-                    try:
-                        if self._is_passport_renewal_query(incoming_msg):
-                            steps_ans = self._extract_passport_renewal_steps(grounding, incoming_msg)
-                            if steps_ans:
-                                history.append({"role": "user", "content": incoming_msg})
-                                history.append({"role": "assistant", "content": steps_ans})
-                                if len(history) > 2 * self.max_history:
-                                    del history[: len(history) - 2 * self.max_history]
-                                return steps_ans
-                    except Exception:
-                        pass
                 return (
                     "No cuento con información suficiente en el documento para responder con precisión. "
                     "¿Puedes reformular tu pregunta o dar más detalles?"
