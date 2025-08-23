@@ -38,7 +38,6 @@ class Config:
     GOOGLE_SERVICE_ACCOUNT_FILE: Optional[str] = None
     TIMEZONE: str = "America/Chicago"
     APPOINTMENT_DURATION_MINUTES: int = 30
-    USE_DETERMINISTIC_EXTRACTORS: bool = False
 
     @classmethod
     def from_env(cls) -> 'Config':
@@ -67,7 +66,6 @@ class Config:
             ),
             TIMEZONE=os.environ.get('TIMEZONE', 'America/Chicago'),
             APPOINTMENT_DURATION_MINUTES=int(os.environ.get('APPOINTMENT_DURATION_MINUTES', '30')),
-            USE_DETERMINISTIC_EXTRACTORS=(os.environ.get('USE_DETERMINISTIC_EXTRACTORS', '0').lower() in {'1','true','yes'})
         )
 
 
@@ -284,6 +282,21 @@ class AppointmentManager:
             )
         )
 
+    def _upcoming_user_events(self, user_key: str) -> List[dict]:
+        now = self._now()
+        return [
+            e for e in self._list_events(
+                now - timedelta(days=1), now + timedelta(days=365), q=None,
+                filter_func=lambda e: (
+                    e.get('status') != 'cancelled' and (
+                        e.get('extendedProperties', {})
+                         .get('private', {})
+                         .get('user_key') == user_key
+                    )
+                )
+            )
+        ]
+
     def _has_conflict(self, start: datetime, end: datetime) -> bool:
         # Check for overlapping events in the target window
         events = self._list_events(start - timedelta(minutes=1), end + timedelta(minutes=1))
@@ -361,10 +374,24 @@ class AppointmentManager:
         return True
 
     def book_at(self, user_key: str, when: datetime) -> Dict[str, Any]:
-        # Enforce monthly limit
+        # Enforce monthly limit; if over limit, propose auto-cancel oldest upcoming and book
         monthly = self._user_events_in_month(user_key)
         if len(monthly) >= 3:
-            return {"success": False, "message": "Has alcanzado el límite de 3 citas este mes."}
+            # Try to cancel the oldest upcoming appointment and proceed
+            upcoming = self._upcoming_user_events(user_key)
+            if upcoming:
+                def start_of(e):
+                    s = e.get('start', {}).get('dateTime')
+                    return datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(self.tz)
+                upcoming.sort(key=start_of)
+                oldest = upcoming[0]
+                try:
+                    self.service.events().delete(calendarId=self.calendar_id, eventId=oldest['id']).execute()
+                    logger.info(f"Auto-cancelled oldest event {oldest['id']} to respect monthly cap")
+                except Exception:
+                    return {"success": False, "message": "Has alcanzado el límite de 3 citas este mes. Cancela una cita existente para continuar."}
+            else:
+                return {"success": False, "message": "Has alcanzado el límite de 3 citas este mes. Cancela una cita existente para continuar."}
         if not self._validate_business_time(when):
             return {"success": False, "message": "El horario de atención es de lunes a viernes de 8:00 a.m. a 1:00 p.m."}
         # Round to nearest 30-min slot
@@ -397,10 +424,23 @@ class AppointmentManager:
         }
 
     def book(self, user_key: str) -> Dict[str, Any]:
-        # Enforce monthly limit of 3 appointments per phone
+        # Enforce monthly limit; auto-cancel oldest upcoming if necessary
         monthly = self._user_events_in_month(user_key)
         if len(monthly) >= 3:
-            return {"success": False, "message": "Has alcanzado el límite de 3 citas este mes."}
+            upcoming = self._upcoming_user_events(user_key)
+            if upcoming:
+                def start_of(e):
+                    s = e.get('start', {}).get('dateTime')
+                    return datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(self.tz)
+                upcoming.sort(key=start_of)
+                oldest = upcoming[0]
+                try:
+                    self.service.events().delete(calendarId=self.calendar_id, eventId=oldest['id']).execute()
+                    logger.info(f"Auto-cancelled oldest event {oldest['id']} to respect monthly cap")
+                except Exception:
+                    return {"success": False, "message": "Has alcanzado el límite de 3 citas este mes. Cancela una cita existente para continuar."}
+            else:
+                return {"success": False, "message": "Has alcanzado el límite de 3 citas este mes. Cancela una cita existente para continuar."}
         # Find next available slot and create event
         when = self._next_business_slot()
         body = self._event_payload(user_key, when)
@@ -437,6 +477,20 @@ class AppointmentManager:
         target = upcoming[0]
         self.service.events().delete(calendarId=self.calendar_id, eventId=target['id']).execute()
         return {"success": True, "message": f"Cita {target['id']} cancelada exitosamente."}
+
+    def cancel_all(self, user_key: str) -> Dict[str, Any]:
+        """Cancel all upcoming appointments for this user."""
+        upcoming = self._upcoming_user_events(user_key)
+        if not upcoming:
+            return {"success": True, "message": "No tienes citas futuras que cancelar."}
+        count = 0
+        for e in upcoming:
+            try:
+                self.service.events().delete(calendarId=self.calendar_id, eventId=e['id']).execute()
+                count += 1
+            except Exception:
+                pass
+        return {"success": True, "message": f"Se cancelaron {count} cita(s)."}
 
     def check_next(self, user_key: str) -> Dict[str, Any]:
         now = self._now()
@@ -573,144 +627,18 @@ class ConsulateBot:
         return uniq
 
     def _retrieve_context(self, query: str, k: int = 8) -> str:
-        """Score and retrieve the most relevant PDF snippets for grounding.
-        Boost currency/fee lines when the user asks about costs or fees.
-        Also include neighboring context around top hits to capture headings.
-        """
-        logger.info(f"Retrieving context for query: '{query}'")
-        
-        if not getattr(self, "_pdf_paragraphs", None):
-            logger.warning("No PDF paragraphs available for retrieval")
-            return ""
-        
-        logger.info(f"Available PDF paragraphs: {len(self._pdf_paragraphs)}")
-        # If the PDF is very small (e.g., <= 10 paragraphs, <= 15k chars), just provide the whole corpus.
-        # This avoids missing info and still fits within small-model limits.
+        """Small PDF path: always return the full corpus (capped) so answers work if the PDF changes."""
         try:
             total_chars = len(self.pdf_corpus or "")
         except Exception:
             total_chars = 0
-        if total_chars <= 15000:
-            logger.info("PDF is small; using full corpus as context")
-            return (self.pdf_corpus or "")[:6000]
-        
-        q = (query or "").lower()
-        words = re.findall(r"\w+", q)
-        # Expand with simple bilingual synonyms/stems for better matching
-        expanded = set(words)
-        if any(w in q for w in ["passport", "pasaporte"]):
-            expanded.update(["passport", "pasaporte", "pasap"])
-        if any(w in q for w in ["renew", "renewal", "renovar", "renovación", "renovacion"]):
-            expanded.update(["renew", "renewal", "renov", "renovar", "renovación", "renovacion", "tramitar", "tramite", "trámite", "issue", "issuance", "expedir", "expedicion", "expedición"])
-        logger.info(f"Query words expanded: {sorted(list(expanded))[:20]}...")
-        
-        want_fee = any(w in q for w in [
-            "fee", "fees", "cost", "price", "tarifa", "tarifas", "costo", "costos", "valor", "pago", "arancel"
-        ])
-        passport_terms = ["passport", "pasaporte"]
-        renew_terms = ["renew", "renewal", "renovar", "renovación"]
-        currency_re = re.compile(r"(US\$|\$|USD|COP)\s?\d[\d,\.]*")
-        
-        logger.info(f"Want fee: {want_fee}")
-
-        scored: List[tuple[int, int]] = []  # (score, idx)
-        for idx, p in enumerate(self._pdf_paragraphs):
-            text = p.lower()
-            # Base overlap
-            base = 0
-            for w in expanded:
-                if not w:
-                    continue
-                if w in text:
-                    base += 1
-                elif len(w) >= 5 and any(stem in text for stem in [w[:5]]):
-                    base += 1
-            if base == 0:
-                # Still consider if paragraph contains strong signals
-                base = 1 if (want_fee and currency_re.search(p)) else 0
-            score = base
-            # Boosts
-            if want_fee and currency_re.search(p):
-                score += 8
-            if any(t in text for t in passport_terms):
-                score += 2
-            if any(t in text for t in renew_terms):
-                score += 2
-            # Slight boost for explicit word 'fee schedule' like phrases
-            if "fee schedule" in text or "tarif" in text:
-                score += 2
-            if score > 0:
-                scored.append((score, idx))
-                logger.info(f"Para {idx} scored {score}: {p[:100]}...")
-
-        logger.info(f"Found {len(scored)} scoring paragraphs")
-        
-        if not scored:
-            logger.warning("No paragraphs scored > 0 for this query")
-            # Debug: show a few random paragraphs to see what we have
-            for i in range(min(3, len(self._pdf_paragraphs))):
-                logger.info(f"Sample para {i}: {self._pdf_paragraphs[i][:200]}...")
-            
-            # Fallback: return first few paragraphs if nothing scored
-            if self._pdf_paragraphs:
-                logger.info("Using fallback: returning first few paragraphs")
-                fallback_ctx = "\n".join(self._pdf_paragraphs[:5])
-                return fallback_ctx[:3500]
+        if total_chars == 0:
+            logger.warning("No PDF corpus loaded")
             return ""
-            
-        scored.sort(key=lambda x: x[0], reverse=True)
-        logger.info(f"Top scoring: {[(s, idx) for s, idx in scored[:3]]}")
-        
-        # Collect top-k with neighbors
-        chosen_idxs = []
-        for _, idx in scored[:k]:
-            for j in [idx-1, idx, idx+1]:
-                if 0 <= j < len(self._pdf_paragraphs):
-                    chosen_idxs.append(j)
-        # De-dup and keep order
-        seen_idx = set()
-        chunks: List[str] = []
-        for i in sorted(set(chosen_idxs)):
-            if i in seen_idx:
-                continue
-            seen_idx.add(i)
-            chunks.append(self._pdf_paragraphs[i])
-        # Cap total context size
-        ctx = "\n".join(chunks)
-        logger.info(f"Retrieved context length: {len(ctx)} chars")
-        logger.info(f"Context preview: {ctx[:300]}...")
-        return ctx[:3500]
+        logger.info("Using full PDF corpus as context")
+        return (self.pdf_corpus or "")[:6000]
 
-    def _is_passport_renewal_query(self, query: str) -> bool:
-        q = (query or "").lower()
-        has_passport = ("passport" in q) or ("pasaport" in q)  # matches pasaporte/pasaport-
-        # Catch Spanish conjugations: renuevo, renovar, renovación, etc., and English renew/renewal
-        renew_signals = ["renew", "renewal", "renov", "tramitar", "trámite", "tramite", "expedir", "expedición", "expedicion", "reexpedir", "sacar"]
-        return has_passport and any(sig in q for sig in renew_signals)
-
-    def _extract_passport_renewal_steps(self, context: str, query: str) -> str:
-        """Extract enumerated steps for passport application/renewal from context.
-        Looks for lines with 1., 2., 3. or semicolon-separated lists in PASAPORTE sections.
-        """
-        if not context:
-            return ""
-        is_spanish = any(w in (query or "").lower() for w in ["cómo", "como", "renovar", "pasaporte"])
-        # Prefer blocks that mention PASAPORTE or PASSPORT
-        blocks = [blk for blk in context.split('\n') if blk]
-        prefer = [b for b in blocks if re.search(r"pasaport|passport", b, re.I)] or blocks
-        text = "\n".join(prefer[:6])
-        # Try to extract enumerated items like 1., 2., 3.
-        items = re.findall(r"(?:^|\s)(\d{1,2})\.?\s*([^;\n]+)(?:;|\n|$)", text, flags=re.M)
-        if not items:
-            # Split by semicolons as fallback
-            parts = [p.strip() for p in re.split(r";|\n", text) if p.strip()]
-            items = [(str(i+1), part) for i, part in enumerate(parts[:5])]
-        if not items:
-            return ""
-        steps = [desc.strip().rstrip('.') for _, desc in items[:5]]
-        if is_spanish:
-            return "Requisitos para renovar el pasaporte (según el documento): " + "; ".join(steps) + "."
-        return "Passport renewal requirements (from the document): " + "; ".join(steps) + "."
+    # Removed deterministic extractors; always answer from PDF context with the model
 
     def _normalize_phone(self, raw: str) -> str:
         """Extract digits so WhatsApp/SMS prefixes don't fragment identity."""
@@ -748,8 +676,37 @@ class ConsulateBot:
         except Exception:
             return ""
 
+    def _interpret_appointment_intent(self, text: str) -> Optional[Dict[str, Any]]:
+        """Use the LLM to parse free-form user text into a structured appointment command.
+        Returns dict like { action: 'book'|'cancel'|'check'|'availability'|'cancel_all', when_iso?: str }.
+        """
+        if not self.openai_client:
+            return None
+        try:
+            comp = self.openai_client.chat.completions.create(
+                model="gpt-5-nano",
+                messages=[
+                    {"role": "system", "content": (
+                        "You convert user messages about appointments into a strict JSON. "
+                        "Allowed actions: book, cancel, check, availability, cancel_all. "
+                        "If a date/time is mentioned, include when_iso in ISO 8601 (YYYY-MM-DDTHH:MM) without timezone. "
+                        "If the user wants to cancel a specific appointment, set action=cancel and when_iso. "
+                        "If they want to cancel all appointments, action=cancel_all. "
+                        "Language can be English or Spanish. Output only JSON."
+                    )},
+                    {"role": "user", "content": text[:500]},
+                ]
+            )
+            raw = self._extract_text_reply(comp)
+            if not raw:
+                return None
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
     def _parse_requested_time(self, text: str) -> Optional[datetime]:
-        """Parse simple requests like 'monday at 1', '8/25 at 1:00 p', 'lunes 1pm'. Returns tz-aware datetime."""
+        """Parse simple requests like 'monday at 1', '8/25 at 1:00 p', 'lunes 1pm', 'today 10', 'tomorrow at noon'."""
         t = (text or "").lower()
         now = datetime.now(ZoneInfo(self.config.TIMEZONE))
         # Try explicit date like 8/25 or 08/25/2025
@@ -762,6 +719,10 @@ class ConsulateBot:
             hour = 12
             minute = 0
             ampm = "pm"
+        if "midnight" in t:
+            hour = 0
+            minute = 0
+            ampm = "am"
         hm = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)?\b", t)
         if hm:
             hour = int(hm.group(1))
@@ -771,6 +732,11 @@ class ConsulateBot:
         weekdays_en = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
         weekdays_es = ["lunes","martes","miercoles","miércoles","jueves","viernes","sabado","sábado","domingo"]
         wd_idx = None
+        # today/tomorrow
+        if any(w in t for w in ["today","hoy"]):
+            wd_idx = now.weekday()
+        elif any(w in t for w in ["tomorrow","mañana"]):
+            wd_idx = (now.weekday() + 1) % 7
         for i, name in enumerate(weekdays_en):
             if name in t:
                 wd_idx = i
@@ -831,54 +797,7 @@ class ConsulateBot:
         snippet = ". ".join(parts[:2])
         return snippet[:500]
 
-    def _is_fee_query(self, query: str) -> bool:
-        q = (query or "").lower()
-        fee_words = ["fee", "fees", "cost", "price", "tarifa", "tarifas", "costo", "valor", "pago", "arancel"]
-        passport_words = ["passport", "pasaporte"]
-        renew_words = ["renew", "renewal", "renovar", "renovación"]
-        return (any(w in q for w in fee_words) or "$" in q) and any(w in q for w in passport_words + renew_words)
-
-    def _extract_fee_answer(self, query: str, context: str) -> str:
-        """Heuristic extraction of fee lines for passport renewal from grounded context.
-        Returns a short bilingual answer quoting the exact amount(s).
-        """
-        if not context:
-            return ""
-        q = (query or "").lower()
-        is_spanish = any(w in q for w in ["cuánto", "renovar", "pasaporte", "tarifa", "costo"])
-        lines = [ln.strip() for ln in context.splitlines() if ln.strip()]
-        currency_re = re.compile(r"(US\$|\$|USD|COP)\s?\d[\d,\.]*")
-        # score lines that mention passport and renew and contain currency
-        scored: List[tuple[int, str]] = []
-        for i, ln in enumerate(lines):
-            low = ln.lower()
-            has_curr = bool(currency_re.search(ln))
-            if not has_curr:
-                continue
-            score = 0
-            if "passport" in low or "pasaporte" in low:
-                score += 3
-            if any(w in low for w in ["renew", "renewal", "renovar", "renovación"]):
-                score += 3
-            if any(w in low for w in ["fee", "tarifa", "costo", "precio", "valor", "pago", "arancel"]):
-                score += 2
-            # consider neighbor lines to capture headings or values on separate lines
-            neighbor = " ".join(lines[max(0, i-1): min(len(lines), i+2)])
-            if currency_re.search(neighbor) and ("passport" in neighbor.lower() or "pasaporte" in neighbor.lower()):
-                score += 2
-            if score:
-                scored.append((score, neighbor.strip()))
-        if not scored:
-            return ""
-        scored.sort(key=lambda x: x[0], reverse=True)
-        best = scored[0][1]
-        # Extract all currency mentions in the best snippet
-        amounts = currency_re.findall(best)
-        # Use the raw neighbor text; keep it concise
-        snippet = best
-        if is_spanish:
-            return f"Según el documento: {snippet}"
-        return f"According to the document: {snippet}"
+    # Removed fee extractor helper
 
     def get_or_create_thread(self, user_id: str) -> List[Dict[str, str]]:
         """Get existing chat history list or create new one for the user."""
@@ -894,10 +813,83 @@ class ConsulateBot:
             return "Exiting the chat. Goodbye!"
 
         try:
-            # 1) Try cheap intent detection first
+            # 1) Try LLM interpreter for appointment commands first (more flexible than regex)
+            user_key = self._normalize_phone(phone_number)
+            cmd = self._interpret_appointment_intent(incoming_msg)
+            if self.appointments and cmd and isinstance(cmd, dict):
+                action = (cmd.get("action") or "").lower()
+                when_iso = cmd.get("when_iso")
+                # Parse when_iso if present
+                when_dt = None
+                if when_iso:
+                    try:
+                        base = datetime.fromisoformat(when_iso)
+                        when_dt = base.replace(tzinfo=ZoneInfo(self.config.TIMEZONE))
+                    except Exception:
+                        when_dt = self._parse_requested_time(incoming_msg)
+                if action == "cancel_all":
+                    res = self.appointments.cancel_all(user_key)
+                    return res["message"]
+                if action == "cancel":
+                    if when_dt:
+                        # cancel the matching appointment (closest at that time)
+                        upcoming = self.appointments._upcoming_user_events(user_key)
+                        target_id = None
+                        for e in upcoming:
+                            s = e.get('start', {}).get('dateTime')
+                            if not s:
+                                continue
+                            sdt = datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(ZoneInfo(self.config.TIMEZONE))
+                            # match same day and hour
+                            if sdt.date() == when_dt.date() and sdt.hour == when_dt.hour and sdt.minute == when_dt.minute:
+                                target_id = e['id']
+                                break
+                        if target_id:
+                            self.appointments.service.events().delete(calendarId=self.appointments.calendar_id, eventId=target_id).execute()
+                            return f"Cita {target_id} cancelada exitosamente."
+                        # fallback to next
+                    res = self.appointments.cancel_next(user_key)
+                    return res["message"]
+                if action == "check":
+                    res = self.appointments.check_next(user_key)
+                    return res["message"]
+                if action == "availability":
+                    # Suggest next 5 or constrained by weekday if mentioned
+                    t = incoming_msg.lower()
+                    mapping = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,
+                               "lunes":0,"martes":1,"miercoles":2,"miércoles":2,"jueves":3,"viernes":4}
+                    day_filter = None
+                    for k, v in mapping.items():
+                        if k in t:
+                            day_filter = v
+                            break
+                    start_from = self.appointments._now()
+                    if any(phrase in t for phrase in ["next week", "proxima semana", "próxima semana", "semana que viene"]):
+                        now = start_from
+                        days_ahead = (7 - now.weekday()) % 7
+                        if days_ahead == 0:
+                            days_ahead = 7
+                        start_from = (now + timedelta(days=days_ahead)).replace(hour=8, minute=0, second=0, microsecond=0)
+                    slots = self.appointments.next_n_slots(5, start_from=start_from, day_filter=day_filter)
+                    if not slots:
+                        return "No encuentro horarios disponibles en este momento dentro del horario de atención (8:00 a 13:00)."
+                    fmt = [s.strftime('%A %d/%m %H:%M') for s in slots]
+                    return "Próximos horarios disponibles: " + "; ".join(fmt)
+                if action == "book":
+                    if when_dt:
+                        result = self.appointments.book_at(user_key, when_dt)
+                        if not result.get("success") and "no está disponible" in (result.get("message", "").lower()):
+                            slots = self.appointments.next_n_slots(5, start_from=when_dt)
+                            if slots:
+                                opts = "; ".join(s.strftime('%A %d/%m %H:%M') for s in slots)
+                                result["message"] += f" Opciones cercanas: {opts}."
+                    else:
+                        result = self.appointments.book(user_key)
+                    return result["message"]
+
+            # 1b) Fallback to regex intents for robustness
             intent = self.intent.classify(incoming_msg)
             if self.appointments and intent["confidence"] >= 0.8:
-                user_key = self._normalize_phone(phone_number)
                 if intent["intent"] == "appointment_request":
                     # Try to parse a requested date/time
                     requested = self._parse_requested_time(incoming_msg)
@@ -915,6 +907,9 @@ class ConsulateBot:
                     return result["message"]
                 if intent["intent"] == "appointment_cancel":
                     result = self.appointments.cancel_next(user_key)
+                    return result["message"]
+                if intent["intent"] == "appointment_cancel_all":
+                    result = self.appointments.cancel_all(user_key)
                     return result["message"]
                 if intent["intent"] == "appointment_check":
                     result = self.appointments.check_next(user_key)
