@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from openai import OpenAI
 from twilio.rest import Client
+from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
 from flask import Flask, request, jsonify, Response
 from pathlib import Path
@@ -18,6 +19,7 @@ from PyPDF2 import PdfReader
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+import httplib2
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,105 +71,7 @@ class Config:
         )
 
 
-class IntentDetector:
-    """Lightweight, cheap intent detection using regex/keywords."""
-
-    BOOK_PATTERNS = [
-        r"\bappoint(ment|ar)?\b",
-        r"\bappoint\w{3,}\b",  # catch misspellings like appointmnet
-        r"\bappoi?ntm?ent\b",   # common typos
-        r"\bappt\b",
-        r"\bbook(ing)?\b",
-        r"\bschedul(e|ed|ing|ar|ar una|ar la)\b",
-        r"\bmake an? appointment\b",
-        r"\bset up\b.*\bappointment\b",
-        r"\breserv(ar|a|ación|ar cita)\b",
-        r"\bagend(ar|ar una|ar la|a)\b",
-        r"\bprogram(ar|ar una|ar la|a)\b",
-        r"\bquiero (una )?cita\b",
-        r"\bnecesito (una )?cita\b",
-        r"\bcita( para| de)?\b",
-        r"\brenovar pasaporte(.*cita)?\b",
-    ]
-    CANCEL_PATTERNS = [
-        r"\bcancel(ar|la|ado|ación| my)?\b",
-        r"\banul(ar|ación)\b",
-        r"\bdelete\b.*\bappointment\b",
-        r"\bborrar cita\b",
-    ]
-    CHECK_PATTERNS = [
-        r"\bcheck(ing)?\b",
-        r"\bverificar\b",
-        r"\bcuando es mi cita\b",
-        r"\bestado de la cita\b",
-        r"\bmi cita\b",
-        r"\bwhat time is my appointment\b",
-        r"\bwhen is my appointment\b",
-        r"\bstatus\b",
-    ]
-    LIST_PATTERNS = [
-        r"\ball (my )?appointments\b",
-        r"\blist( (my )?appointments)?\b",
-        r"\bver (todas|todas mis) citas\b",
-        r"\btodas mis citas\b",
-        r"\blistar citas\b",
-        r"\blista de citas\b",
-    ]
-    AVAIL_PATTERNS = [
-    r"\bavailable\b",
-    r"\bavailability\b",
-    # common misspelling
-    r"\bavail(?:able|ability|ible)\b",
-    # related words users use for openings
-    r"\bopen(?:ing|ings)?\b",
-    r"\bslots?\b",
-    r"\bwhat (times?|hours?)\b",
-    r"\bnext week\b",
-    r"\bthis week\b",
-        r"\bwhen (are|is) (appointments|appt|citas) available\b",
-        r"\bhorarios disponibles\b",
-    r"\bhoras? disponibles\b",
-        r"\bdisponible(s)?\b",
-        r"\besta(n)? disponible(s)?\b",
-        r"\bhay (citas|horarios)\b",
-    r"\bpr(?:ó|o)xima semana\b",
-    r"\bsemana que viene\b",
-    r"\besta semana\b",
-        r"\bes monday available\b",
-        r"\besta el lunes disponible\b",
-    ]
-
-    def __init__(self, client: Optional[OpenAI] = None):
-        self.client = client
-
-        
-    def classify(self, text: str) -> Dict[str, Any]:
-        # Model-only classification for flexibility in production
-        if self.client:
-            try:
-                comp = self.client.chat.completions.create(
-                    model="gpt-5-nano",
-                    messages=[
-                        {"role": "system", "content": (
-                            "Classify this user message into a consulate intent. Output strict JSON: {\"intent\": <string>, \"confidence\": <0-1>}. "
-                            "Intents: appointment_request, appointment_cancel, appointment_check, appointment_availability, appointment_list, appointment_cancel_all, general_inquiry. "
-                            "If it's about appointments (citas) in any way, choose the closest appointment_* intent. English or Spanish."
-                        )},
-                        {"role": "user", "content": (text or "")[:500]}
-                    ]
-                )
-                raw = comp.choices[0].message.content
-                data = json.loads(raw)
-                intent = data.get("intent", "general_inquiry")
-                conf = float(data.get("confidence", 0.6))
-                allowed = {"appointment_request", "appointment_cancel", "appointment_check", "appointment_availability", "appointment_list", "appointment_cancel_all", "general_inquiry"}
-                if intent not in allowed:
-                    intent = "general_inquiry"
-                return {"intent": intent, "confidence": conf}
-            except Exception:
-                return {"intent": "general_inquiry", "confidence": 0.5}
-        # If model not available, default to general_inquiry
-        return {"intent": "general_inquiry", "confidence": 0.5}
+# Removed IntentDetector; single-model interpretation will be used
 
 
 class AppointmentManager:
@@ -190,13 +94,7 @@ class AppointmentManager:
         try:
             sa_path = self.cfg.GOOGLE_SERVICE_ACCOUNT_FILE
             if not sa_path:
-                # Fallback: try detect a JSON service account in CWD
-                for name in os.listdir('.'):
-                    if name.endswith('.json') and 'service' in name.lower():
-                        sa_path = name
-                        break
-            if not sa_path:
-                raise ValueError("Missing GOOGLE_SERVICE_ACCOUNT_FILE or GOOGLE_APPLICATION_CREDENTIALS env var, and no service account JSON detected in current directory.")
+                raise ValueError("Missing GOOGLE_SERVICE_ACCOUNT_FILE or GOOGLE_APPLICATION_CREDENTIALS env var.")
             logger.info(f"Using Google credentials file at: {os.path.abspath(sa_path)}")
             creds = service_account.Credentials.from_service_account_file(sa_path, scopes=self.scopes)
             # Log the service account email to aid configuration
@@ -206,7 +104,8 @@ class AppointmentManager:
                     logger.info(f"Google service account: {sa_email}")
             except Exception:
                 pass
-            return build('calendar', 'v3', credentials=creds, cache_discovery=False)
+            http = httplib2.Http(timeout=10)
+            return build('calendar', 'v3', credentials=creds, cache_discovery=False, http=http)
         except Exception as e:
             logger.error(f"Google Calendar auth/build error: {e}")
             raise
@@ -214,7 +113,7 @@ class AppointmentManager:
     def _verify_calendar_access(self) -> None:
         """Fail fast if the calendar ID is invalid or not shared with the service account."""
         try:
-            info = self.service.calendars().get(calendarId=self.calendar_id).execute()
+            info = self.service.calendars().get(calendarId=self.calendar_id).execute(num_retries=2)
             logger.info(f"Google Calendar ready: {info.get('summary')} ({self.calendar_id})")
         except HttpError as he:
             status = getattr(he.resp, 'status', None)
@@ -259,7 +158,7 @@ class AppointmentManager:
                 q=q,
                 pageToken=page_token,
             )
-            res = req.execute()
+            res = req.execute(num_retries=2)
             batch = res.get('items', [])
             if filter_func:
                 batch = [e for e in batch if filter_func(e)]
@@ -384,8 +283,15 @@ class AppointmentManager:
         end = when + self.duration
         if self._has_conflict(when, end):
             return {"success": False, "message": "Ese horario no está disponible. ¿Deseas el siguiente disponible?"}
-        created = self.service.events().insert(calendarId=self.calendar_id, body=self._event_payload(user_key, when)).execute()
-        return {"success": True, "message": f"Cita confirmada para {when.strftime('%d/%m/%Y %H:%M')}. ID: {created.get('id')}", "event": created}
+        created = self.service.events().insert(
+            calendarId=self.calendar_id,
+            body=self._event_payload(user_key, when)
+        ).execute(num_retries=2)
+        return {
+            "success": True,
+            "message": f"Cita confirmada para {when.strftime('%d/%m/%Y %H:%M')}. ID: {created.get('id')}",
+            "event": created,
+        }
 
     def _event_payload(self, user_key: str, when: datetime, summary: str = "Consulate Appointment") -> dict:
         end = when + self.duration
@@ -415,7 +321,7 @@ class AppointmentManager:
         # Find next available slot and create event
         when = self._next_business_slot()
         body = self._event_payload(user_key, when)
-        created = self.service.events().insert(calendarId=self.calendar_id, body=body).execute()
+        created = self.service.events().insert(calendarId=self.calendar_id, body=body).execute(num_retries=2)
         start_dt = when.strftime('%d/%m/%Y %H:%M')
         return {
             "success": True,
@@ -446,7 +352,7 @@ class AppointmentManager:
             return datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone(self.tz)
         upcoming.sort(key=start_of)
         target = upcoming[0]
-        self.service.events().delete(calendarId=self.calendar_id, eventId=target['id']).execute()
+        self.service.events().delete(calendarId=self.calendar_id, eventId=target['id']).execute(num_retries=2)
         return {"success": True, "message": f"Cita {target['id']} cancelada exitosamente."}
 
     def cancel_all(self, user_key: str) -> Dict[str, Any]:
@@ -457,7 +363,7 @@ class AppointmentManager:
         count = 0
         for e in upcoming:
             try:
-                self.service.events().delete(calendarId=self.calendar_id, eventId=e['id']).execute()
+                self.service.events().delete(calendarId=self.calendar_id, eventId=e['id']).execute(num_retries=2)
                 count += 1
             except Exception:
                 pass
@@ -515,10 +421,15 @@ class ConsulateBot:
         self.openai_client = OpenAI(
             api_key=config.OPENAI_API_KEY
         )
+        # Optional request timeout for OpenAI calls (seconds)
+        try:
+            self.openai_timeout = int(os.environ.get('OPENAI_TIMEOUT', '12'))
+        except Exception:
+            self.openai_timeout = 12
         self.threads = {}  # In-memory message history per user id
         self.max_history = 2  # messages to keep per user
         self.twilio_client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
-        self.intent = IntentDetector(self.openai_client)
+    # No separate intent detector; we use a single-model interpreter per message
         # Short-lived pending actions per user (e.g., cap cancel -> then proceed)
         self.pending_actions: Dict[str, Dict[str, Any]] = {}
         # Quick auth check; only disable client on real auth errors
@@ -531,8 +442,7 @@ class ConsulateBot:
             auth_error = ("Missing bearer" in msg) or ("401" in msg) or ("invalid_api_key" in msg)
             if auth_error:
                 self.openai_client = None
-                # Also disable model fallback in intent
-                self.intent = IntentDetector(None)
+                # Interpreter will be disabled implicitly when openai_client is None
             else:
                 logger.warning("Proceeding with OpenAI client despite healthcheck error (non-auth).")
         try:
@@ -550,6 +460,55 @@ class ConsulateBot:
                 logger.warning("PDF file not found or empty")
         except Exception as e:
             logger.warning(f"Failed to load PDF for grounding: {e}")
+
+    def _route_or_answer(self, user_msg: str, history: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+        """Single LLM call that decides between appointment intent vs. general answer.
+        Returns one of:
+          {"mode":"appointment", "action":"book|cancel|check|availability|cancel_all|list", "when_iso"?: str}
+          {"mode":"answer", "text": str}
+        """
+        if not self.openai_client:
+            return None
+        grounding = self._retrieve_context(user_msg)
+        system_router = (
+            "You are an assistant for a consulate. Decide if the user message is about appointments, or a general consular question. "
+            "If it is about appointments, output JSON with mode=appointment and an action in {book,cancel,check,availability,cancel_all,list}. "
+            "If a specific date/time is mentioned, include when_iso in ISO 8601 (YYYY-MM-DDTHH:MM) without timezone. "
+            "If it is a general question, answer concisely (1-2 sentences) in the user's language and output JSON with mode=answer and text. "
+            "Do not include any keys other than those requested. Output only JSON."
+        )
+        system_context = (
+            f"Use ONLY this context to answer general questions. If insufficient, say you don't know.\n{grounding}"
+            if grounding else "If no context is provided, say you don't know."
+        )
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": system_router},
+            {"role": "system", "content": system_context},
+            *history[-self.max_history:],
+            {"role": "user", "content": user_msg},
+        ]
+        try:
+            try:
+                comp = self.openai_client.chat.completions.create(
+                    model="gpt-5-nano",
+                    messages=messages,
+                    timeout=self.openai_timeout,
+                )
+            except TypeError:
+                # SDK may not support timeout kwarg
+                comp = self.openai_client.chat.completions.create(
+                    model="gpt-5-nano",
+                    messages=messages,
+                )
+            raw = self._extract_text_reply(comp)
+            if not raw:
+                return None
+            data = json.loads(raw)
+            if isinstance(data, dict) and data.get("mode") in {"appointment", "answer"}:
+                return data
+        except Exception as e:
+            logger.warning(f"Router call failed: {e}")
+        return None
 
     def _load_pdf_text(self, path: Path) -> str:
         reader = PdfReader(str(path))
@@ -753,6 +712,19 @@ class ConsulateBot:
             user_key = self._normalize_phone(phone_number)
             # Handle pending ephemeral flows (e.g., monthly-cap cancel selection)
             pend = self.pending_actions.get(user_key)
+            # Enforce TTL (15 minutes) for pending actions
+            if pend and isinstance(pend, dict):
+                try:
+                    ts_str = pend.get("ts")
+                    if ts_str:
+                        ts = datetime.fromisoformat(ts_str)
+                        now_utc = datetime.now(timezone.utc)
+                        if (now_utc - ts) > timedelta(minutes=15):
+                            self.pending_actions.pop(user_key, None)
+                            pend = None
+                except Exception:
+                    self.pending_actions.pop(user_key, None)
+                    pend = None
             if pend and isinstance(pend, dict):
                 sel = (incoming_msg or "").strip().lower()
                 # Accept simple numeric 1..9 or responses like "opcion 2"
@@ -814,25 +786,12 @@ class ConsulateBot:
                             except Exception:
                                 break
                     # If not found, continue with normal flow
-            # 1) AI-first: classify with LLM, then delegate to appointment or general pipeline
-            intent = self.intent.classify(incoming_msg)
-            if self.appointments and intent and intent.get("intent", "") != "general_inquiry":
-                # Appointment pipeline: use interpreter to get action and time
-                cmd = self._interpret_appointment_intent(incoming_msg)
-                if not cmd or not cmd.get("action"):
-                    # Derive action from classified intent if interpreter failed
-                    intent_to_action = {
-                        "appointment_request": "book",
-                        "appointment_cancel": "cancel",
-                        "appointment_check": "check",
-                        "appointment_availability": "availability",
-                        "appointment_list": "list",
-                        "appointment_cancel_all": "cancel_all",
-                    }
-                    fallback_action = intent_to_action.get(intent.get("intent", ""), "book")
-                    cmd = {"action": fallback_action}
-                action = (cmd.get("action") or "").lower()
-                when_iso = cmd.get("when_iso")
+            # 1) Single model call: route or answer
+            history = self.get_or_create_thread(phone_number)
+            route = self._route_or_answer(incoming_msg, history)
+            if route and route.get("mode") == "appointment" and self.appointments:
+                action = (route.get("action") or "").lower()
+                when_iso = route.get("when_iso")
                 # Parse when_iso if present
                 when_dt = None
                 if when_iso:
@@ -951,92 +910,35 @@ class ConsulateBot:
                                     lines.append(f"{i}) {dt.strftime('%A %d/%m %H:%M')} (ID: {e['id']})")
                                 return "Ya tienes 3 citas este mes. Responde 1, 2 o 3 para cancelar una y continuar:\n" + "\n".join(lines)
                     return result["message"]
+            # 2) If mode=answer
+            if route and route.get("mode") == "answer":
+                text = (route.get("text") or "").strip()
+                if text:
+                    history.append({"role": "user", "content": incoming_msg})
+                    history.append({"role": "assistant", "content": text})
+                    if len(history) > 2 * self.max_history:
+                        del history[: len(history) - 2 * self.max_history]
+                    return text
+                # Fall back to snippet if empty
+                grounding = self._retrieve_context(incoming_msg)
+                snippet = self._fallback_from_context(incoming_msg, grounding)
+                return snippet or (
+                    "No cuento con información suficiente en el documento para responder con precisión. "
+                    "¿Puedes reformular tu pregunta o dar más detalles?"
+                )
 
-            # 1b) No regex fallback: if model is unavailable, we go to general/Q&A pathway below
-
-            # 2) Fall back to chat completions for general inquiries
+            # 3) If model unavailable
             if not self.openai_client:
                 return (
                     "Lo siento, el servicio de respuestas no está disponible en este momento. "
                     "Puedo ayudarte a programar, verificar o cancelar una cita."
                 )
-            history = self.get_or_create_thread(phone_number)
+
+            # 4) Router failed: safe fallback to snippet
             grounding = self._retrieve_context(incoming_msg)
-            # (Deterministic extractors removed)
-
-            system_persona = (
-                "Eres un asistente virtual del consulado. Responde solo a preguntas de servicios consulares "
-                "(visados, pasaportes, asistencia legal, etc.). Si no sabes la respuesta o no está en el contexto, "
-                "indícalo amablemente. Responde directo en 1–2 oraciones, sin pasos de razonamiento ni explicaciones largas. "
-                "Responde en el mismo idioma del usuario (español o inglés)."
-            )
-            system_context = (
-                f"Use ONLY this context to answer. If details are present, summarize them clearly (steps, requirements, documents, fees) and cite exact amounts as written. If insufficient, say you don't know.\n{grounding}"
-                if grounding else "If no context is provided, say you don't know."
-            )
-
-            messages: List[Dict[str, str]] = [
-                {"role": "system", "content": system_persona},
-                {"role": "system", "content": system_context},
-            ]
-            # Append a small rolling history to preserve continuity
-            messages.extend(history[-self.max_history:])
-            messages.append({"role": "user", "content": incoming_msg})
-
-            try:
-                comp = self.openai_client.chat.completions.create(
-                    model="gpt-5-nano",
-                    #max_completion_tokens=350,
-                    messages=messages,
-                )
-            except Exception as e:
-                msg = str(e)
-                # Retry with trimmed context if token/output limit triggered
-                if "max_tokens" in msg or "output limit" in msg:
-                    logger.warning("Retrying with trimmed context due to token/output limit")
-                    trimmed_ctx = (grounding or "")[:1200]
-                    trimmed_messages: List[Dict[str, str]] = [
-                        {"role": "system", "content": system_persona},
-                        {"role": "system", "content": (
-                            f"Use ONLY this context to answer. If insufficient, say you don't know.\n{trimmed_ctx}"
-                            if trimmed_ctx else "If no context is provided, say you don't know."
-                        )},
-                        # keep only the last 2 exchanges max
-                        *history[-2:],
-                        {"role": "user", "content": incoming_msg},
-                    ]
-                    comp = self.openai_client.chat.completions.create(
-                        model="gpt-5-nano",
-                       #max_completion_tokens=300,
-                        messages=trimmed_messages,
-                    )
-                else:
-                    raise
-            reply = self._extract_text_reply(comp)
-            if reply:
-                # Update history
-                history.append({"role": "user", "content": incoming_msg})
-                history.append({"role": "assistant", "content": reply})
-                # trim
-                if len(history) > 2 * self.max_history:
-                    del history[: len(history) - 2 * self.max_history]
-                return reply
-
-            # Safe fallback when the model returned no text
-            if grounding:
-                # Last-resort: surface a snippet directly from the document
-                snippet = self._fallback_from_context(incoming_msg, grounding)
-                if snippet:
-                    history.append({"role": "user", "content": incoming_msg})
-                    history.append({"role": "assistant", "content": snippet})
-                    if len(history) > 2 * self.max_history:
-                        del history[: len(history) - 2 * self.max_history]
-                    logger.info("Using context snippet fallback")
-                    return snippet
-                return (
-                    "No cuento con información suficiente en el documento para responder con precisión. "
-                    "¿Puedes reformular tu pregunta o dar más detalles?"
-                )
+            snippet = self._fallback_from_context(incoming_msg, grounding)
+            if snippet:
+                return snippet
             return (
                 "No pude generar una respuesta en este momento. Intenta reformular la pregunta o "
                 "pídeme programar, verificar o cancelar una cita."
@@ -1063,24 +965,15 @@ def create_app(config: Config) -> Flask:
     def webhook_reply() -> str:
         """Unified webhook for SMS/WhatsApp"""
         try:
+            # Validate Twilio signature
+            signature = request.headers.get('X-Twilio-Signature', '')
+            validator = RequestValidator(config.TWILIO_AUTH_TOKEN)
+            url = request.url  # full URL of this request
+            if not validator.validate(url, request.form, signature):
+                logger.warning("Twilio signature validation failed")
+                return ("Forbidden", 403)
             incoming_msg = request.values.get('Body', '').strip()
             phone_number = request.values.get('From', '')
-            response = MessagingResponse()
-            response.message(bot.process_message(phone_number, incoming_msg))
-            return str(response)
-        except Exception as e:
-            logger.error(f"Error in webhook handler: {str(e)}")
-            response = MessagingResponse()
-            response.message("Lo siento, ocurrió un error. Por favor, intenta de nuevo más tarde.")
-            return str(response)
-
-    @app.route('/whatsapp', methods=['POST'])
-    def whatsapp_reply() -> str:
-        """Handle incoming WhatsApp messages"""
-        try:
-            incoming_msg = request.values.get('Body', '').strip()
-            phone_number = request.values.get('From', '')
-            
             response = MessagingResponse()
             response.message(bot.process_message(phone_number, incoming_msg))
             return str(response)
