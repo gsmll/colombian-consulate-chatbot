@@ -35,8 +35,6 @@ class Config:
     TWILIO_ACCOUNT_SID: str
     TWILIO_AUTH_TOKEN: str
     OPENAI_ORG_ID: Optional[str] = None
-    OPENAI_PROJECT_ID: Optional[str] = None
-    OPENAI_ASSISTANT_ID: Optional[str] = None
     GOOGLE_CALENDAR_ID: Optional[str] = None
     GOOGLE_SERVICE_ACCOUNT_FILE: Optional[str] = None
     TIMEZONE: str = "America/Chicago"
@@ -60,14 +58,8 @@ class Config:
             OPENAI_API_KEY=os.environ.get('OPENAI_API_KEY'),
             TWILIO_ACCOUNT_SID=os.environ.get('TWILIO_ACCOUNT_SID'),
             TWILIO_AUTH_TOKEN=os.environ.get('TWILIO_AUTH_TOKEN'),
-            OPENAI_ORG_ID=os.environ.get('OPENAI_ORG_ID'),
-            OPENAI_PROJECT_ID=os.environ.get('OPENAI_PROJECT_ID'),
-            OPENAI_ASSISTANT_ID=os.environ.get('OPENAI_ASSISTANT_ID'),
             GOOGLE_CALENDAR_ID=os.environ.get('GOOGLE_CALENDAR_ID'),
-            GOOGLE_SERVICE_ACCOUNT_FILE=(
-                os.environ.get('GOOGLE_SERVICE_ACCOUNT_FILE')
-                or os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
-            ),
+            GOOGLE_SERVICE_ACCOUNT_FILE=os.environ.get('GOOGLE_SERVICE_ACCOUNT_FILE'),
             TIMEZONE=os.environ.get('TIMEZONE', 'America/Chicago'),
             APPOINTMENT_DURATION_MINUTES=int(
                 os.environ.get('APPOINTMENT_DURATION_MINUTES', '30')),
@@ -282,7 +274,8 @@ class AppointmentManager:
             when = self._next_business_slot()
         else:
             if not self._validate_business_time(when):
-                return {"success": False, "message": "El horario de atención es de lunes a viernes de 8:00 a.m. a 1:30 p.m."}
+                # Business hours end at 13:00 (1:00 p.m.) strictly
+                return {"success": False, "message": "El horario de atención es de lunes a viernes de 8:00 a.m. a 1:00 p.m."}
             # Round to nearest 30-min slot
             minute = (when.minute // 30) * 30
             when = when.replace(minute=minute, second=0, microsecond=0)
